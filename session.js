@@ -1,6 +1,6 @@
 "use strict";
 // ================================================================
-// session.js  v3.0.0  |  PRONTO-AI — UNIFIED TEMPLATE
+// session.js  v3.2.0  |  PRONTO-AI — UNIFIED TEMPLATE  (EVAL-config: blocks + FTMO-limits + 1.9R London)
 //
 // One codebase for every account. Pick the account with the FIRM env var:
 //   FIRM = ftmo_demo | ftmo_eval | maven | vantage | fundednext
@@ -80,7 +80,7 @@ const FIRMS = {
 // no block (tracking only). Values are fractions, e.g. 0.05 = 5%.
 const FIRM_LIMITS = {
   ftmo_demo:  { dailyLossPct: null, maxTotalDDPct: null, trailing: false }, // demo: no guard, collect everything
-  ftmo_eval:  { dailyLossPct: null, maxTotalDDPct: null, trailing: false }, // ⚠️ e.g. daily 0.05 / total 0.10
+  ftmo_eval:  { dailyLossPct: 0.05, maxTotalDDPct: 0.10, trailing: false }, // FTMO: 5% daily / 10% totaal (statisch)
   maven:      { dailyLossPct: null, maxTotalDDPct: null, trailing: false }, // ⚠️ fill from firm rules
   vantage:    { dailyLossPct: null, maxTotalDDPct: null, trailing: false }, // ⚠️ fill from firm rules
   fundednext: { dailyLossPct: null, maxTotalDDPct: null, trailing: false }, // ⚠️ fill from firm rules
@@ -112,13 +112,25 @@ const RISK_WINDOWS = {
 // for a ticker+hour. Anything not listed falls through to DEFAULT_TP_RR.
 const DEFAULT_TP_RR = 1.5;
 const TP_RR_WINDOWS = {
-  // "XAUUSD": [{ start: 1500, end: 1700, rr: 2.0 }],   // example only — keep empty
+  // DATA (ghost-milestones, jul 2026): wie 1.5R haalt, haalt vrijwel altijd ook
+  // 1.9R (18->18, nul verval) -> zelfde winrate, +0.4R per winnaar. Alleen in
+  // het bewezen London-window. NIET hoger zetten zonder v_ev_grid/v_walkforward.
+  // Geldt ALLEEN voor live firms — demo (collect) blijft flat 1.5R als
+  // schone controle-dataset (zie guard in getTpRR).
+  "US100.cash": [{ start: 1000, end: 1400, rr: 1.9 }],
 };
 
 // ── Time blocks (per canonical ticker). DEMO (collect mode) IGNORES these.
 //    Empty = nothing blocked (all live firms take everything until the model).
 const TIME_BLOCK_WINDOWS = {
-  // "US100.cash": [{ start: 1100, end: 1600 }],
+  // DATA (646 bot-trades jun-jul 2026, oud+nieuw beide negatief):
+  //   US100 15-18u Brussels: 33% WR, -24.9R over 135 trades  -> je giftigste zone
+  //   XAUUSD 19-23u Brussels: 38% WR, -2.4R over 84 trades   -> NY-goud, bevestigd
+  //   XAUUSD 10-14u Brussels: 47% WR, +0.09R over 161 trades -> breakeven; op een
+  //     eval kost elke breakeven-trade daily-loss-ruimte -> eruit. (Demo meet door.)
+  "US100.cash": [{ start: 1500, end: 1800 }],
+  "XAUUSD":     [{ start: 1000, end: 1400 },
+                 { start: 1900, end: 2300 }],
 };
 
 // Symbols we explicitly refuse (other indices that must never be traded).
@@ -266,6 +278,7 @@ function isTimeBlocked(symbolKey, date = null) {
 
 // TP risk-reward for a ticker at a given time.
 function getTpRR(symbolKey, date = null) {
+  if (MODE === "collect") return DEFAULT_TP_RR;   // demo blijft flat 1.5R — schone controle
   const windows = TP_RR_WINDOWS[symbolKey];
   if (windows) {
     const { hhmm } = getBrusselsComponents(date);
