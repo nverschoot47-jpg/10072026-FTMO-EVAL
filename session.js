@@ -1,6 +1,19 @@
 "use strict";
 // ================================================================
-// session.js  v3.2.0  |  PRONTO-AI — UNIFIED TEMPLATE  (EVAL-config: blocks + FTMO-limits + 1.9R London)
+// session.js  v3.3.0  |  PRONTO-AI — UNIFIED TEMPLATE  (EVAL-config: blocks + RR + risk-mult)
+//
+// v3.3.0 (20 jul 2026) — CONFIG herzien op 635 ghosts (496 oud + 139 nieuw),
+// met STRIKTE volgorde-toets (+X bereikt VOOR -1.0) en een HEDGE-PAAR-analyse
+// (158 paren: tegengestelde richting, binnen 30 min geopend).
+//
+//   Kernbevinding hedge-paren, TP 1.5R:
+//     een leg TP  59% -> +0.5R    |  BEIDE SL (chop) 40% -> -2.0R
+//     EV per paar -0.47R  => de dubbel-SL-kans, NIET de TP-hoogte, bepaalt alles.
+//   Dubbel-SL% per uur is daarmee de zuiverste killzone-detector:
+//     US100 17u 75% | US100 14u 67% | XAU 15u 83% | XAU 18-19u 60%  -> DICHT
+//     US100 10u 17% | XAU 13u 0-20% | XAU 8u 14%                    -> OPEN
+//
+// Alleen CONFIG gewijzigd t.o.v. v3.2.0 — geen enkele functie aangeraakt.
 //
 // One codebase for every account. Pick the account with the FIRM env var:
 //   FIRM = ftmo_demo | ftmo_eval | maven | vantage | fundednext
@@ -85,6 +98,7 @@ const FIRM_LIMITS = {
   vantage:    { dailyLossPct: null, maxTotalDDPct: null, trailing: false }, // ⚠️ fill from firm rules
   fundednext: { dailyLossPct: null, maxTotalDDPct: null, trailing: false }, // ⚠️ fill from firm rules
 };
+
 // ── RISK WINDOWS — THE adaptive lever ─────────────────────────────────
 // This is where you raise risk where the data says your EV is best.
 // RR stays flat at 1.5R; you scale RISK, per firm + ticker + hour zone.
@@ -98,8 +112,20 @@ const FIRM_LIMITS = {
 //
 // Fill these per firm from the ghost data (best avg peak-R per zone).
 const RISK_WINDOWS = {
-  // ftmo_demo stays FLAT on purpose — it is the clean control dataset.
-  // ftmo_eval:  { "XAUUSD": [{ start: 1500, end: 1700, mult: 1.5 }] },
+  // ftmo_demo staat er BEWUST niet in: de demo blijft vlak op 1.0x meten —
+  // dat is de schone controledataset waar de optimizer op rekent.
+  //
+  // US100 10:00-12:00 = de enige zone met bewijs voor MEER size:
+  //   EV/trade +0.31R @2.5R (n=57) en dubbel-SL slechts 17% per hedge-paar.
+  // Gekozen: 1.5x, niet 2.0x. Reden: dezelfde zone had een reeks van 6
+  // verliezers achter elkaar. Op 1.5x is dat -9R, op 2.0x -12R; bij 0,25%
+  // risico per trade is dat 2,25% resp. 3,0% van je account uit EEN ochtend —
+  // op een 5%-daglimiet. De EV verdubbelt bij 2x, maar de drawdown ook, en
+  // het is de drawdown die een eval beeindigt.
+  // Wil je toch 2.0x: zet mult op 2.0 en verlaag DEFAULT_RISK_PCT navenant.
+  ftmo_eval: {
+    "US100.cash": [{ start: 1000, end: 1200, mult: 1.5 }],
+  },
   // maven:      {},
   // vantage:    {},
   // fundednext: {},
@@ -112,25 +138,39 @@ const RISK_WINDOWS = {
 // for a ticker+hour. Anything not listed falls through to DEFAULT_TP_RR.
 const DEFAULT_TP_RR = 1.5;
 const TP_RR_WINDOWS = {
-  // DATA (ghost-milestones, jul 2026): wie 1.5R haalt, haalt vrijwel altijd ook
-  // 1.9R (18->18, nul verval) -> zelfde winrate, +0.4R per winnaar. Alleen in
-  // het bewezen London-window. NIET hoger zetten zonder v_ev_grid/v_walkforward.
-  // Geldt ALLEEN voor live firms — demo (collect) blijft flat 1.5R als
-  // schone controle-dataset (zie guard in getTpRR).
-  "US100.cash": [{ start: 1000, end: 1400, rr: 1.9 }],
+  // US100 10:00-12:00 -> 2.5R  (was 1.9R)
+  //   n=57 (33 oud + 24 nieuw, consistent: WR@1.9 41% oud vs 36% nieuw)
+  //   EV per trade: 1.5R +0.05 | 1.9R +0.16 | 2.5R +0.31 (shrunk +0.26)
+  //   Hedge-paar 10u: dubbel-SL slechts 17% -> EV/paar +0.08 (1.5R) tot +0.92 (2.5R)
+  //   NIET hoger dan 2.5: 3.0R/4.0R lijken beter maar de winrate is daar VLAK
+  //   (runner-effect op ~6 trades) -> een enkele runner minder kantelt het.
+  // US100 12:00-14:00 -> 1.9R  (ongewijzigd t.o.v. v3.2.0)
+  "US100.cash": [{ start: 1000, end: 1200, rr: 2.5 },
+                 { start: 1200, end: 1400, rr: 1.9 }],
+  // XAUUSD blijft overal 1.5R: op geen enkel goud-uur is een hogere TP bewezen
+  // beter (12u/13u/22u zijn positief JUIST op 1.5R).
 };
 
 // ── Time blocks (per canonical ticker). DEMO (collect mode) IGNORES these.
 //    Empty = nothing blocked (all live firms take everything until the model).
 const TIME_BLOCK_WINDOWS = {
-  // DATA (646 bot-trades jun-jul 2026, oud+nieuw beide negatief):
-  //   US100 15-18u Brussels: 33% WR, -24.9R over 135 trades  -> je giftigste zone
-  //   XAUUSD 19-23u Brussels: 38% WR, -2.4R over 84 trades   -> NY-goud, bevestigd
-  //   XAUUSD 10-14u Brussels: 47% WR, +0.09R over 161 trades -> breakeven; op een
-  //     eval kost elke breakeven-trade daily-loss-ruimte -> eruit. (Demo meet door.)
-  "US100.cash": [{ start: 1500, end: 1800 }],
-  "XAUUSD":     [{ start: 1000, end: 1400 },
-                 { start: 1900, end: 2300 }],
+  // Onderbouwing per uur — 635 ghosts, strikte volgorde + dubbel-SL per hedge-paar.
+  //
+  // US100 14:00-18:00  (was 15:00-18:00)
+  //   14u: EV -0.40 (n=26), dubbel-SL 67% (9 paren) -> slechtste uur van de dag
+  //   15u: EV -0.22 (n=41), dubbel-SL 50% | 16u: -0.24 (n=42), 54% | 17u: -0.30 (n=32), 75%
+  //   19-21u block van v3.2.1 is VERVALLEN: gecombineerd n=11, EV -0.05 = neutraal.
+  //
+  // XAUUSD 10:00-12:00 + 15:00-18:00 + 19:00-22:00
+  //   10u: EV -0.17 (n=41), dubbel-SL 42% | 11u: -0.31 (n=40), 56%      -> dicht
+  //   12-15u: EV +0.06/+0.05, dubbel-SL 0-20%                            -> OPEN (was dicht)
+  //   15u: EV -0.33 (n=19), dubbel-SL 83% | 16u: -0.21 | 17u: -0.25      -> dicht
+  //   19u: EV -0.36 (n=20) | 20u: -0.18 | 21u: -0.08                     -> dicht
+  //   22-23u: EV +0.08 (n=11), beste paar-EV van goud                    -> OPEN (was dicht)
+  "US100.cash": [{ start: 1400, end: 1800 }],
+  "XAUUSD":     [{ start: 1000, end: 1200 },
+                 { start: 1500, end: 1800 },
+                 { start: 1900, end: 2200 }],
 };
 
 // Symbols we explicitly refuse (other indices that must never be traded).
@@ -165,7 +205,9 @@ const FIRM_CFG        = FIRMS[FIRM];
 //   off    — model never runs
 //   shadow — model runs and is logged to model_decisions, but never blocks (default)
 //   live   — a model "skip" verdict blocks the trade
-const MODEL_MODE = (process.env.MODEL_MODE || "shadow").toLowerCase().trim();const MODE            = FIRM_CFG.mode;                 // "collect" | "live"
+const MODEL_MODE = (process.env.MODEL_MODE || "shadow").toLowerCase().trim();
+
+const MODE            = FIRM_CFG.mode;                 // "collect" | "live"
 const SYMBOL_CATALOG  = FIRM_CFG.symbols;             // canonical -> { mt5, type, volMin, volStep }
 const BROKER          = FIRM;                          // back-compat alias for server.js
 const BROKER_SYMBOL_MAP = { [FIRM]: FIRM_CFG.symbols };// back-compat shape for server.js
