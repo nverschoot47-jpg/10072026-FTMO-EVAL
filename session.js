@@ -138,17 +138,66 @@ const RISK_WINDOWS = {
 // for a ticker+hour. Anything not listed falls through to DEFAULT_TP_RR.
 const DEFAULT_TP_RR = 1.5;
 const TP_RR_WINDOWS = {
-  // US100 10:00-12:00 -> 2.5R  (was 1.9R)
-  //   n=57 (33 oud + 24 nieuw, consistent: WR@1.9 41% oud vs 36% nieuw)
-  //   EV per trade: 1.5R +0.05 | 1.9R +0.16 | 2.5R +0.31 (shrunk +0.26)
-  //   Hedge-paar 10u: dubbel-SL slechts 17% -> EV/paar +0.08 (1.5R) tot +0.92 (2.5R)
-  //   NIET hoger dan 2.5: 3.0R/4.0R lijken beter maar de winrate is daar VLAK
-  //   (runner-effect op ~6 trades) -> een enkele runner minder kantelt het.
-  // US100 12:00-14:00 -> 1.9R  (ongewijzigd t.o.v. v3.2.0)
-  "US100.cash": [{ start: 1000, end: 1200, rr: 2.5 },
-                 { start: 1200, end: 1400, rr: 1.9 }],
-  // XAUUSD blijft overal 1.5R: op geen enkel goud-uur is een hogere TP bewezen
-  // beter (12u/13u/22u zijn positief JUIST op 1.5R).
+  // ⚠️ BRON (22 jul 2026): per-uur RR uit de Pine ghost-tracker tabellen
+  // (screenshots) — per uur de RR die de HOOGSTE EV gaf in die scan. Dit is
+  // dezelfde bron als v3.3.1, ANDERS dan de eerdere double-tested 10-12u/12-14u
+  // regels hierboven in dit bestand (die met strikte volgorde-toets + hedge-
+  // paar-analyse gevalideerd waren). Bekend CONFLICT: double-tested gaf 10u
+  // 2.5R (n=57) / 12u 1.9R — deze scan geeft 10u 2.9R (n=105) / 11u 1.5R
+  // (n=110) / 12u 0.6R (n=86). Behandel als startpunt, niet als bewezen.
+  // Elk uur niet hieronder gelijst valt terug op DEFAULT_TP_RR (1.5R).
+  "XAUUSD": [
+    { start: 0,    end: 100,  rr: 3.0 },
+    { start: 100,  end: 200,  rr: 3.0 },
+    { start: 200,  end: 300,  rr: 3.0 },
+    { start: 300,  end: 400,  rr: 2.6 },
+    { start: 400,  end: 500,  rr: 2.8 },
+    { start: 500,  end: 600,  rr: 2.8 },
+    { start: 600,  end: 700,  rr: 2.4 },
+    { start: 700,  end: 800,  rr: 1.3 },
+    { start: 800,  end: 900,  rr: 2.7 },
+    { start: 900,  end: 1000, rr: 2.7 },
+    { start: 1000, end: 1100, rr: 1.2 },
+    { start: 1100, end: 1200, rr: 0.7 },
+    { start: 1200, end: 1300, rr: 2.5 },
+    { start: 1300, end: 1400, rr: 1.4 },
+    { start: 1400, end: 1500, rr: 1.4 },
+    { start: 1500, end: 1600, rr: 1.9 },
+    { start: 1600, end: 1700, rr: 0.6 },
+    { start: 1700, end: 1800, rr: 0.8 },
+    { start: 1800, end: 1900, rr: 0.8 },
+    { start: 1900, end: 2000, rr: 0.6 },
+    { start: 2000, end: 2100, rr: 0.6 },
+    { start: 2100, end: 2200, rr: 0.6 },
+    { start: 2200, end: 2300, rr: 2.5 },
+    // 23:00 ontbreekt in de ghost-tracker tabel -> valt terug op DEFAULT_TP_RR (1.5R).
+  ],
+  // ⚠️ NQ 21:00-23:00 ontbraken in de screenshot (rij afgesneden) -> geen entry
+  // hieronder, dus die uren vallen terug op DEFAULT_TP_RR (1.5R) tot je die cijfers
+  // aanlevert.
+  "US100.cash": [
+    { start: 0,    end: 100,  rr: 2.8 },
+    { start: 100,  end: 200,  rr: 1.4 },
+    { start: 200,  end: 300,  rr: 1.5 },
+    { start: 300,  end: 400,  rr: 3.0 },
+    { start: 400,  end: 500,  rr: 0.6 },
+    { start: 500,  end: 600,  rr: 2.4 },
+    { start: 600,  end: 700,  rr: 1.8 },
+    { start: 700,  end: 800,  rr: 1.9 },
+    { start: 800,  end: 900,  rr: 2.2 },
+    { start: 900,  end: 1000, rr: 2.3 },
+    { start: 1000, end: 1100, rr: 2.9 },
+    { start: 1100, end: 1200, rr: 1.5 },
+    { start: 1200, end: 1300, rr: 0.6 },
+    { start: 1300, end: 1400, rr: 0.7 },
+    { start: 1400, end: 1500, rr: 0.6 },
+    { start: 1500, end: 1600, rr: 0.8 },
+    { start: 1600, end: 1700, rr: 0.6 },
+    { start: 1700, end: 1800, rr: 0.9 },
+    { start: 1800, end: 1900, rr: 1.3 },
+    { start: 1900, end: 2000, rr: 1.7 },
+    { start: 2000, end: 2100, rr: 1.9 },
+  ],
 };
 
 // ── Time blocks (per canonical ticker). DEMO (collect mode) IGNORES these.
