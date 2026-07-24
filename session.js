@@ -1,19 +1,31 @@
 "use strict";
 // ================================================================
-// session.js  v3.3.0  |  PRONTO-AI — UNIFIED TEMPLATE  (EVAL-config: blocks + RR + risk-mult)
+// session.js  v3.4.0  |  PRONTO-AI — UNIFIED TEMPLATE
 //
-// v3.3.0 (20 jul 2026) — CONFIG herzien op 635 ghosts (496 oud + 139 nieuw),
-// met STRIKTE volgorde-toets (+X bereikt VOOR -1.0) en een HEDGE-PAAR-analyse
-// (158 paren: tegengestelde richting, binnen 30 min geopend).
+// v3.4.0 (23 jul 2026) — CONFIG HERZIEN op 240 SCHONE ghosts uit de
+// data-collector (132 US100 + 108 XAUUSD, 13-23 juli, huidige systeem).
 //
-//   Kernbevinding hedge-paren, TP 1.5R:
-//     een leg TP  59% -> +0.5R    |  BEIDE SL (chop) 40% -> -2.0R
-//     EV per paar -0.47R  => de dubbel-SL-kans, NIET de TP-hoogte, bepaalt alles.
-//   Dubbel-SL% per uur is daarmee de zuiverste killzone-detector:
-//     US100 17u 75% | US100 14u 67% | XAU 15u 83% | XAU 18-19u 60%  -> DICHT
-//     US100 10u 17% | XAU 13u 0-20% | XAU 8u 14%                    -> OPEN
+// WAT ER VERANDERDE T.O.V. v3.3.1 EN WAAROM
 //
-// Alleen CONFIG gewijzigd t.o.v. v3.2.0 — geen enkele functie aangeraakt.
+// 1. PER-UUR RR-TABEL VERVANGEN DOOR ZONES.
+//    De oude tabel koos per uur het beste van ~45 RR-niveaus bij n≈5 per
+//    uur. Het maximum van 45 ruizige schattingen ligt structureel te hoog:
+//    dat is selectiebias, geen edge. Zichtbaar aan de sprongen 10u 2.9R,
+//    11u 1.5R, 12u 0.6R — drie aangrenzende uren van dezelfde markt.
+//    Nu: 2-3 zones per symbool met n=12-33, RR geklemd op 1.0-2.5.
+//
+// 2. ALLE RR ONDER 1.0 VERWIJDERD.
+//    Break-even winrate = 1/(1+RR). Bij 0.6R heb je 62,5% nodig, vóór
+//    spread en commissie. Hoogste gemeten winrate in de dataset: 56%.
+//
+// 3. ZONES MET n<10 KRIJGEN GEEN EIGEN RR — die vallen terug op
+//    DEFAULT_TP_RR. Op n=6 het maximum van de curve kiezen is punt 1.
+//
+// 4. RISK-MULTIPLIER 2.0x OP DE POSITIEVE-EV ZONES (n>=10 EN EV>0).
+//    Drie zones halen die lat. Zie RISK_WINDOWS voor de drawdown-rekensom.
+//
+// 5. TWEE DODE ZONES DICHT: US100 02-04u en 19-23u (EV -0.55, avg peak
+//    0.44-0.54R — de gemiddelde trade komt daar niet halverwege zijn SL).
 //
 // One codebase for every account. Pick the account with the FIRM env var:
 //   FIRM = ftmo_demo | ftmo_eval | maven | vantage | fundednext
@@ -30,20 +42,21 @@ const TIMEZONE = "Europe/Brussels";
 // ======================================================================
 
 // Risk per trade as a fraction of equity. 0.000375 = 0.0375%.
+// Met RISK_EQUITY=50000 -> $18,75 per trade op 1.0x.
 const DEFAULT_RISK_PCT = 0.000375;
 
 // Server SL = sl_pct (from webhook) × SL_BUFFER_MULT × broker execution price.
-// The 1.5 buffer covers spread + timing lag. Lower later if you want.
 const SL_BUFFER_MULT = 1.5;
+
+// Harde grenzen voor elke RR die uit een venster komt. Voorkomt dat een
+// typefout (0.06 i.p.v. 0.6) of een toekomstige AI-config iets onmogelijks
+// doorlaat. 1.0 = break-even bij 50% WR; 2.5 = break-even bij 28,6%.
+const RR_MIN = 1.0;
+const RR_MAX = 2.5;
 
 // ── Per-firm MT5 reroute + broker lot rules ───────────────────────────
 //   mt5         = the exact symbol string on THAT broker's MT5
-//   type        = "commodity" (gold) or "index" (nasdaq)
-//   volMin      = smallest lot THIS broker allows (HARD floor to trade)
-//   volStep     = lot must be a multiple of this, on THIS broker
-//   lotDecimals = how many decimals THIS broker accepts on lot size
-//                 (2 = 0.01 lots, 1 = 0.1 lots, 0 = whole lots).
-//                 Overrides the value derived from volStep. Set per firm.
+//   volMin/Step = broker lot rules; lotDecimals overrides derived decimals
 //   mode        = "collect" (take EVERYTHING, never filtered) or "live"
 const FIRMS = {
   ftmo_demo: {
@@ -69,7 +82,7 @@ const FIRMS = {
     },
   },
   vantage: {
-    label: "VANTAGE", mode: "live", lotDecimals: 2,   // firm default
+    label: "VANTAGE", mode: "live", lotDecimals: 2,
     symbols: {
       "XAUUSD":     { mt5: "XAUUSD", type: "commodity", pip: 0.01, volMin: 0.01, volStep: 0.01 },
       // Nasdaq on Vantage trades in 0.1 steps → override decimals for THIS symbol only.
@@ -86,139 +99,94 @@ const FIRMS = {
   },
 };
 
-// ── Prop-firm drawdown limits (feature #1 — block wiring pending) ──────
-// The high-water-mark tracker (1C) already records daily peak/trough open P&L
-// and all-time equity peak. When you give the real numbers per firm, fill these
-// in and the drawdown guard becomes a one-liner in canOpenNewTrade. Left null =
-// no block (tracking only). Values are fractions, e.g. 0.05 = 5%.
+// ── Prop-firm drawdown limits ─────────────────────────────────────────
 const FIRM_LIMITS = {
-  ftmo_demo:  { dailyLossPct: null, maxTotalDDPct: null, trailing: false }, // demo: no guard, collect everything
-  ftmo_eval:  { dailyLossPct: 0.05, maxTotalDDPct: 0.10, trailing: false }, // FTMO: 5% daily / 10% totaal (statisch)
+  ftmo_demo:  { dailyLossPct: null, maxTotalDDPct: null, trailing: false }, // demo: geen guard
+  ftmo_eval:  { dailyLossPct: 0.05, maxTotalDDPct: 0.10, trailing: false }, // FTMO 5%/10% statisch
   maven:      { dailyLossPct: null, maxTotalDDPct: null, trailing: false }, // ⚠️ fill from firm rules
   vantage:    { dailyLossPct: null, maxTotalDDPct: null, trailing: false }, // ⚠️ fill from firm rules
   fundednext: { dailyLossPct: null, maxTotalDDPct: null, trailing: false }, // ⚠️ fill from firm rules
 };
 
-// ── RISK WINDOWS — THE adaptive lever ─────────────────────────────────
-// This is where you raise risk where the data says your EV is best.
-// RR stays flat at 1.5R; you scale RISK, per firm + ticker + hour zone.
+// ── RISK WINDOWS — 2.0x op de positieve-EV zones ──────────────────────
 //
-//   RISK_WINDOWS[firm][canonicalTicker] = [{ start, end, mult }]
-//   start/end = Brussels hhmm, end-EXCLUSIVE.  mult = risk multiplier.
+//   Criterium: n >= 10 EN EV > 0 in de schone dataset. Drie zones halen dat.
+//   Zones met n < 10 blijven op 1.0x, hoe mooi hun EV ook oogt — op n=6 is
+//   +0.75R één trade verschil.
 //
-// Final risk = DEFAULT_RISK_PCT × mult.  Empty / no match = 1.0 (flat).
-// Example — double risk on Nasdaq 15:00–17:00 on Vantage only:
-//   vantage: { "US100.cash": [{ start: 1500, end: 1700, mult: 2.0 }] },
+//     ZONE                    n     RR     WR     EV      mult
+//     US100  10:00-12:00     33    1.25   48%   +0.09     2.0x
+//     XAUUSD 00:00-06:00     14    2.50   36%   +0.25     2.0x
+//     XAUUSD 17:00-19:00     12    1.25   50%   +0.12     2.0x
 //
-// Fill these per firm from the ghost data (best avg peak-R per zone).
+//   DE REKENSOM (eval 10k, RISK_EQUITY=50000):
+//     1.0x = $18,75/trade = 0,19% van het account
+//     2.0x = $37,50/trade = 0,375%
+//   Zes verliezers op rij in de 10-12u zone (is voorgekomen) = -2,25%.
+//   Past binnen de 5%-daglimiet. MAAR dit systeem hedget: op 21 juli stonden
+//   er TIEN US100-posities tegelijk open. Tien legs op 2.0x die samen
+//   uitstoppen = 3,75% op één dag, 75% van je daglimiet uit één cluster.
+//   Het risico zit in de STAPELING, niet in de reeks.
+//   Twee manieren om dat af te dekken:
+//     a) max-gelijktijdige-posities guard in server.js, of
+//     b) DEFAULT_RISK_PCT naar 0.00025 (dan is 2.0x weer 0,25%/trade).
 const RISK_WINDOWS = {
   // ftmo_demo staat er BEWUST niet in: de demo blijft vlak op 1.0x meten —
   // dat is de schone controledataset waar de optimizer op rekent.
-  //
-  // US100 10:00-12:00 = de enige zone met bewijs voor MEER size:
-  //   EV/trade +0.31R @2.5R (n=57) en dubbel-SL slechts 17% per hedge-paar.
-  // Gekozen: 1.5x, niet 2.0x. Reden: dezelfde zone had een reeks van 6
-  // verliezers achter elkaar. Op 1.5x is dat -9R, op 2.0x -12R; bij 0,25%
-  // risico per trade is dat 2,25% resp. 3,0% van je account uit EEN ochtend —
-  // op een 5%-daglimiet. De EV verdubbelt bij 2x, maar de drawdown ook, en
-  // het is de drawdown die een eval beeindigt.
-  // Wil je toch 2.0x: zet mult op 2.0 en verlaag DEFAULT_RISK_PCT navenant.
   ftmo_eval: {
-    "US100.cash": [{ start: 1000, end: 1200, mult: 1.5 }],
+    "US100.cash": [{ start: 1000, end: 1200, mult: 2.0 }],
+    "XAUUSD":     [{ start: 0,    end: 600,  mult: 2.0 },
+                   { start: 1700, end: 1900, mult: 2.0 }],
   },
   // maven:      {},
   // vantage:    {},
   // fundednext: {},
 };
 
-// ── TP risk-reward ────────────────────────────────────────────────────
-// FLAT 1.5R everywhere, for every ticker, every hour, every firm.
-// RR is NOT the adaptive lever — risk is (see RISK_WINDOWS above).
-// Leave TP_RR_WINDOWS empty unless you deliberately want to override RR
-// for a ticker+hour. Anything not listed falls through to DEFAULT_TP_RR.
+// ── TP risk-reward — ZONES, niet per uur ──────────────────────────────
 const DEFAULT_TP_RR = 1.5;
 const TP_RR_WINDOWS = {
-  // ⚠️ BRON (22 jul 2026): per-uur RR uit de Pine ghost-tracker tabellen
-  // (screenshots) — per uur de RR die de HOOGSTE EV gaf in die scan. Dit is
-  // dezelfde bron als v3.3.1, ANDERS dan de eerdere double-tested 10-12u/12-14u
-  // regels hierboven in dit bestand (die met strikte volgorde-toets + hedge-
-  // paar-analyse gevalideerd waren). Bekend CONFLICT: double-tested gaf 10u
-  // 2.5R (n=57) / 12u 1.9R — deze scan geeft 10u 2.9R (n=105) / 11u 1.5R
-  // (n=110) / 12u 0.6R (n=86). Behandel als startpunt, niet als bewezen.
-  // Elk uur niet hieronder gelijst valt terug op DEFAULT_TP_RR (1.5R).
-  "XAUUSD": [
-    { start: 0,    end: 100,  rr: 3.0 },
-    { start: 100,  end: 200,  rr: 3.0 },
-    { start: 200,  end: 300,  rr: 3.0 },
-    { start: 300,  end: 400,  rr: 2.6 },
-    { start: 400,  end: 500,  rr: 2.8 },
-    { start: 500,  end: 600,  rr: 2.8 },
-    { start: 600,  end: 700,  rr: 2.4 },
-    { start: 700,  end: 800,  rr: 1.3 },
-    { start: 800,  end: 900,  rr: 2.7 },
-    { start: 900,  end: 1000, rr: 2.7 },
-    { start: 1000, end: 1100, rr: 1.2 },
-    { start: 1100, end: 1200, rr: 0.7 },
-    { start: 1200, end: 1300, rr: 2.5 },
-    { start: 1300, end: 1400, rr: 1.4 },
-    { start: 1400, end: 1500, rr: 1.4 },
-    { start: 1500, end: 1600, rr: 1.9 },
-    { start: 1600, end: 1700, rr: 0.6 },
-    { start: 1700, end: 1800, rr: 0.8 },
-    { start: 1800, end: 1900, rr: 0.8 },
-    { start: 1900, end: 2000, rr: 0.6 },
-    { start: 2000, end: 2100, rr: 0.6 },
-    { start: 2100, end: 2200, rr: 0.6 },
-    { start: 2200, end: 2300, rr: 2.5 },
-    // 23:00 ontbreekt in de ghost-tracker tabel -> valt terug op DEFAULT_TP_RR (1.5R).
-  ],
-  // ⚠️ NQ 21:00-23:00 ontbraken in de screenshot (rij afgesneden) -> geen entry
-  // hieronder, dus die uren vallen terug op DEFAULT_TP_RR (1.5R) tot je die cijfers
-  // aanlevert.
+  // US100 (n=132)
+  //   10-12u  n=33 -> 1.25R : WR 48% EV +0.09 | 1.5R -0.02 | 1.9R -0.12 | 2.5R -0.05
+  //           grootste sample van de dataset; het laagste niveau wint duidelijk
+  //   12-14u  n=25 -> 2.5R  : WR 28% EV -0.02 | 1.9R -0.19 | 1.5R -0.30 | 1.0R -0.44
+  //           exact break-even. Open gelaten, maar dit is de eerste kandidaat
+  //           om te blokkeren als hij negatief blijft.
+  //   00-02u (n=9), 04-07u (n=8), 07-10u (n=6): te dun -> DEFAULT_TP_RR.
   "US100.cash": [
-    { start: 0,    end: 100,  rr: 2.8 },
-    { start: 100,  end: 200,  rr: 1.4 },
-    { start: 200,  end: 300,  rr: 1.5 },
-    { start: 300,  end: 400,  rr: 3.0 },
-    { start: 400,  end: 500,  rr: 0.6 },
-    { start: 500,  end: 600,  rr: 2.4 },
-    { start: 600,  end: 700,  rr: 1.8 },
-    { start: 700,  end: 800,  rr: 1.9 },
-    { start: 800,  end: 900,  rr: 2.2 },
-    { start: 900,  end: 1000, rr: 2.3 },
-    { start: 1000, end: 1100, rr: 2.9 },
-    { start: 1100, end: 1200, rr: 1.5 },
-    { start: 1200, end: 1300, rr: 0.6 },
-    { start: 1300, end: 1400, rr: 0.7 },
-    { start: 1400, end: 1500, rr: 0.6 },
-    { start: 1500, end: 1600, rr: 0.8 },
-    { start: 1600, end: 1700, rr: 0.6 },
-    { start: 1700, end: 1800, rr: 0.9 },
-    { start: 1800, end: 1900, rr: 1.3 },
-    { start: 1900, end: 2000, rr: 1.7 },
-    { start: 2000, end: 2100, rr: 1.9 },
+    { start: 1000, end: 1200, rr: 1.25 },
+    { start: 1200, end: 1400, rr: 2.5  },
+  ],
+  // XAUUSD (n=108)
+  //   00-06u  n=14 -> 2.5R  : WR 36% EV +0.25 (3.0R gaf +0.43, geklemd op 2.5)
+  //   13-15u  n=18 -> 1.25R : WR 44% EV  0.00 | 1.5R -0.17 | 2.5R -0.42
+  //   17-19u  n=12 -> 1.25R : WR 50% EV +0.12 | 1.5R -0.17
+  //   06-10u (n=6) en 22-23u (n=6): te dun -> DEFAULT_TP_RR.
+  "XAUUSD": [
+    { start: 0,    end: 600,  rr: 2.5  },
+    { start: 1300, end: 1500, rr: 1.25 },
+    { start: 1700, end: 1900, rr: 1.25 },
   ],
 };
 
-// ── Time blocks (per canonical ticker). DEMO (collect mode) IGNORES these.
-//    Empty = nothing blocked (all live firms take everything until the model).
+// ── Time blocks (per canonical ticker). DEMO (collect) IGNORES these. ──
 const TIME_BLOCK_WINDOWS = {
-  // Onderbouwing per uur — 635 ghosts, strikte volgorde + dubbel-SL per hedge-paar.
-  //
-  // US100 14:00-18:00  (was 15:00-18:00)
-  //   14u: EV -0.40 (n=26), dubbel-SL 67% (9 paren) -> slechtste uur van de dag
-  //   15u: EV -0.22 (n=41), dubbel-SL 50% | 16u: -0.24 (n=42), 54% | 17u: -0.30 (n=32), 75%
-  //   19-21u block van v3.2.1 is VERVALLEN: gecombineerd n=11, EV -0.05 = neutraal.
-  //
-  // XAUUSD 10:00-12:00 + 15:00-18:00 + 19:00-22:00
-  //   10u: EV -0.17 (n=41), dubbel-SL 42% | 11u: -0.31 (n=40), 56%      -> dicht
-  //   12-15u: EV +0.06/+0.05, dubbel-SL 0-20%                            -> OPEN (was dicht)
-  //   15u: EV -0.33 (n=19), dubbel-SL 83% | 16u: -0.21 | 17u: -0.25      -> dicht
-  //   19u: EV -0.36 (n=20) | 20u: -0.18 | 21u: -0.08                     -> dicht
-  //   22-23u: EV +0.08 (n=11), beste paar-EV van goud                    -> OPEN (was dicht)
-  "US100.cash": [{ start: 1400, end: 1800 }],
+  // US100
+  //   02-04u  n=10  EV -0.55  avg peak 0.54   -> NIEUW, dode chop
+  //   14-18u  n=20 vers (EV -0.50 / -0.17) + n=84-115 historisch, beide negatief
+  //   19-23u  n=11  EV -0.55  avg peak 0.44   -> NIEUW, laagste peak van de dag
+  "US100.cash": [{ start: 200,  end: 400  },
+                 { start: 1400, end: 1800 },
+                 { start: 1900, end: 2300 }],
+  // XAUUSD
+  //   10-12u  vers n=16 EV +0.12 (alleen op 1.0R) vs historisch n=81 EV -0.17/-0.31
+  //           -> gecombineerd bewijs leunt negatief, blijft DICHT. Laat de
+  //              optimizer dit heropenen als de verse data volhoudt.
+  //   15-17u  n=17  EV -0.41  -> dicht. (Dit venster is op 21 juli heropend na
+  //           één 6,32R-runner; de volledige dataset weerlegt dat. Hersteld.)
+  //   19-22u  n=19  EV -0.47  -> best onderbouwde blok van goud, ook historisch
   "XAUUSD":     [{ start: 1000, end: 1200 },
-                 { start: 1500, end: 1800 },
+                 { start: 1500, end: 1700 },
                  { start: 1900, end: 2200 }],
 };
 
@@ -232,8 +200,6 @@ const BLOCKED_SYMBOLS = new Set([
 ]);
 
 // TradingView symbol → canonical key.
-// ONLY the two tickers the webhook actually sends. Nothing else is accepted —
-// any other symbol falls through to SYMBOL_NOT_ALLOWED and is logged, not traded.
 const SYMBOL_ALIASES = {
   "MGC1!": "XAUUSD",      // Micro Gold    → gold
   "MNQ1!": "US100.cash",  // Micro Nasdaq  → nasdaq
@@ -248,36 +214,32 @@ const FIRM = (process.env.FIRM || process.env.BROKER || "ftmo_demo").toLowerCase
 if (!FIRMS[FIRM]) {
   throw new Error(`[session.js] Unknown FIRM="${FIRM}". Must be: ${Object.keys(FIRMS).join(" | ")}`);
 }
-const FIRM_CFG        = FIRMS[FIRM];
+const FIRM_CFG = FIRMS[FIRM];
 
-// ── Model gate mode (feature 10) ──────────────────────────────────────
-//   off    — model never runs
-//   shadow — model runs and is logged to model_decisions, but never blocks (default)
-//   live   — a model "skip" verdict blocks the trade
+// ── Model gate mode ───────────────────────────────────────────────────
+//   off | shadow (default, logt maar blokkeert nooit) | live
 const MODEL_MODE = (process.env.MODEL_MODE || "shadow").toLowerCase().trim();
 
-const MODE            = FIRM_CFG.mode;                 // "collect" | "live"
-const SYMBOL_CATALOG  = FIRM_CFG.symbols;             // canonical -> { mt5, type, volMin, volStep }
-const BROKER          = FIRM;                          // back-compat alias for server.js
-const BROKER_SYMBOL_MAP = { [FIRM]: FIRM_CFG.symbols };// back-compat shape for server.js
+const MODE              = FIRM_CFG.mode;
+const SYMBOL_CATALOG    = FIRM_CFG.symbols;
+const BROKER            = FIRM;
+const BROKER_SYMBOL_MAP = { [FIRM]: FIRM_CFG.symbols };
 
-console.log(`[session.js] FIRM="${FIRM}" (${FIRM_CFG.label}) mode=${MODE} | ` +
+console.log(`[session.js] v3.4.0 FIRM="${FIRM}" (${FIRM_CFG.label}) mode=${MODE} | ` +
   `gold->"${SYMBOL_CATALOG["XAUUSD"].mt5}" nasdaq->"${SYMBOL_CATALOG["US100.cash"].mt5}"`);
 
-// ── Volume rounding: round DOWN to volStep, enforce volMin, apply multiplier ──
+// ── Volume rounding: round DOWN to volStep, enforce volMin ────────────
 function roundLots(rawLots, symInfo) {
   const step = symInfo.volStep ?? 0.01;
   const min  = symInfo.volMin  ?? 0.01;
-  // Decimal precedence:  per-SYMBOL override  →  per-FIRM default  →  derived from volStep.
-  // A broker that only accepts 1 decimal must never be sent 0.37.
   const stepStr = step.toString();
   const derived = stepStr.includes(".") ? stepStr.split(".")[1].length : 0;
   const decimals = Number.isInteger(symInfo.lotDecimals) ? symInfo.lotDecimals
                  : Number.isInteger(FIRM_CFG.lotDecimals) ? FIRM_CFG.lotDecimals
                  : derived;
-  const stepsCount = Math.floor(rawLots / step + 1e-9);          // guard float drift
+  const stepsCount = Math.floor(rawLots / step + 1e-9);
   const stepped    = parseFloat((stepsCount * step).toFixed(decimals));
-  const result     = Math.max(min, stepped);                      // never below broker minimum
+  const result     = Math.max(min, stepped);
   return parseFloat(result.toFixed(decimals));
 }
 
@@ -316,11 +278,8 @@ function isWeekend(date = null) {
 }
 
 // ── Symbol normalization ──────────────────────────────────────────────
-// Canonical form used for matching: strip EVERYTHING that is not A-Z or 0-9.
-// So "MGC1!", "mgc1!", " MGC1 " all reduce to "MGC1".
 function _canon(s) { return s.toString().toUpperCase().replace(/[^A-Z0-9]/g, ""); }
 
-// Pre-build the lookup once: canonical-input → canonical key.
 const _ALIAS_LOOKUP = {};
 for (const [alias, target] of Object.entries(SYMBOL_ALIASES)) _ALIAS_LOOKUP[_canon(alias)] = target;
 
@@ -331,8 +290,6 @@ function normalizeSymbol(raw) {
 
 function getSymbolInfo(raw) {
   if (!raw) return null;
-  // Accept a canonical key directly (server.js normalizes first, then calls this
-  // with "XAUUSD" / "US100.cash"), OR a raw webhook ticker ("MGC1!").
   if (SYMBOL_CATALOG[raw]) return { ...SYMBOL_CATALOG[raw], key: raw };
   const key = normalizeSymbol(raw);
   if (!key || !SYMBOL_CATALOG[key]) return null;
@@ -344,7 +301,7 @@ function getVwapPosition(price, vwapMid) {
   return parseFloat(price) >= parseFloat(vwapMid) ? "above" : "below";
 }
 
-// Optimizer key = "XAUUSD_london_buy_above" — the analytics bucket the AI learns from.
+// Optimizer key = "XAUUSD_london_buy_above"
 function buildOptimizerKey(symbol, session, direction, vwapPos) {
   return `${symbol}_${session}_${direction}_${vwapPos}`;
 }
@@ -367,19 +324,31 @@ function isTimeBlocked(symbolKey, date = null) {
   return null;
 }
 
-// TP risk-reward for a ticker at a given time.
+// TP risk-reward voor een ticker op een tijdstip — MET CLAMP.
 function getTpRR(symbolKey, date = null) {
-  if (MODE === "collect") return DEFAULT_TP_RR;   // demo blijft flat 1.5R — schone controle
+  if (MODE === "collect") return DEFAULT_TP_RR;   // demo blijft flat 1.5R
   const windows = TP_RR_WINDOWS[symbolKey];
   if (windows) {
     const { hhmm } = getBrusselsComponents(date);
-    for (const w of windows) if (hhmm >= w.start && hhmm < w.end) return w.rr;
+    for (const w of windows) {
+      if (hhmm >= w.start && hhmm < w.end) {
+        const rr = Number(w.rr);
+        if (!Number.isFinite(rr)) break;
+        const clamped = Math.min(Math.max(rr, RR_MIN), RR_MAX);
+        if (clamped !== rr) {
+          console.warn(`[session.js] RR ${rr} buiten [${RR_MIN}, ${RR_MAX}] voor ${symbolKey} ` +
+            `${_fmtHHMM(w.start)}-${_fmtHHMM(w.end)} -> geklemd op ${clamped}`);
+        }
+        return clamped;
+      }
+    }
   }
   return DEFAULT_TP_RR;
 }
 
-// Risk multiplier for this firm + ticker at a given time (default 1.0).
+// Risk multiplier voor deze firm + ticker op een tijdstip (default 1.0).
 function getRiskMult(symbolKey, date = null) {
+  if (MODE === "collect") return 1.0;             // demo meet altijd op 1.0x
   const byFirm = RISK_WINDOWS[FIRM];
   const windows = byFirm && byFirm[symbolKey];
   if (!windows || !windows.length) return 1.0;
@@ -388,8 +357,8 @@ function getRiskMult(symbolKey, date = null) {
   return 1.0;
 }
 
-// Gate: weekends + unknown/blocked symbols always refused.
-// Time blocks apply to LIVE firms only — DEMO (collect) takes everything.
+// Gate: weekends + onbekende/geblokte symbolen altijd geweigerd.
+// Time blocks gelden alleen voor LIVE firms — DEMO (collect) neemt alles.
 function canOpenNewTrade(rawSymbol, date = null) {
   if (isWeekend(date)) return { allowed: false, reason: "WEEKEND" };
   const upper = (rawSymbol || "").toString().toUpperCase().trim().replace(/[^A-Z0-9./]/g, "");
@@ -404,7 +373,7 @@ function canOpenNewTrade(rawSymbol, date = null) {
 }
 
 module.exports = {
-  TIMEZONE, DEFAULT_RISK_PCT, SL_BUFFER_MULT,
+  TIMEZONE, DEFAULT_RISK_PCT, SL_BUFFER_MULT, RR_MIN, RR_MAX,
   FIRM, MODE, MODEL_MODE, BROKER, BROKER_SYMBOL_MAP, FIRMS, FIRM_LIMITS,
   SYMBOL_CATALOG, SYMBOL_ALIASES,
   getBrusselsComponents, getBrusselsDateStr,
