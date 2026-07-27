@@ -51,7 +51,7 @@ const SL_BUFFER_MULT = 1.5;
 // Harde grenzen voor elke RR die uit een venster komt. Voorkomt dat een
 // typefout (0.06 i.p.v. 0.6) of een toekomstige AI-config iets onmogelijks
 // doorlaat. 1.0 = break-even bij 50% WR; 2.5 = break-even bij 28,6%.
-const RR_MIN = 1.0;
+const RR_MIN = 1.5;  // vloer — nooit lager dan 1.5R
 const RR_MAX = 2.5;
 
 // ── Per-firm MT5 reroute + broker lot rules ───────────────────────────
@@ -146,48 +146,20 @@ const RISK_WINDOWS = {
 // ── TP risk-reward — ZONES, niet per uur ──────────────────────────────
 const DEFAULT_TP_RR = 1.5;
 const TP_RR_WINDOWS = {
-  // US100 (n=132)
-  //   10-12u  n=33 -> 1.25R : WR 48% EV +0.09 | 1.5R -0.02 | 1.9R -0.12 | 2.5R -0.05
-  //           grootste sample van de dataset; het laagste niveau wint duidelijk
-  //   12-14u  n=25 -> 2.5R  : WR 28% EV -0.02 | 1.9R -0.19 | 1.5R -0.30 | 1.0R -0.44
-  //           exact break-even. Open gelaten, maar dit is de eerste kandidaat
-  //           om te blokkeren als hij negatief blijft.
-  //   00-02u (n=9), 04-07u (n=8), 07-10u (n=6): te dun -> DEFAULT_TP_RR.
+  // Vloer 1.5R overal. Hoger alleen waar ghost-staart EN journal het dragen.
   "US100.cash": [
-    { start: 1000, end: 1200, rr: 1.25 },
-    { start: 1200, end: 1400, rr: 2.5  },
+    { start: 1000, end: 1400, rr: 2.0 },   // London: ghost 2.5R-staart + journal +0.17 (n=59)
+    { start: 1400, end: 1900, rr: 1.5 },   // NY: TP op vloer, 2x size via RISK_WINDOWS
   ],
-  // XAUUSD (n=108)
-  //   00-06u  n=14 -> 2.5R  : WR 36% EV +0.25 (3.0R gaf +0.43, geklemd op 2.5)
-  //   13-15u  n=18 -> 1.25R : WR 44% EV  0.00 | 1.5R -0.17 | 2.5R -0.42
-  //   17-19u  n=12 -> 1.25R : WR 50% EV +0.12 | 1.5R -0.17
-  //   06-10u (n=6) en 22-23u (n=6): te dun -> DEFAULT_TP_RR.
   "XAUUSD": [
-    { start: 0,    end: 600,  rr: 2.5  },
-    { start: 1300, end: 1500, rr: 1.25 },
-    { start: 1700, end: 1900, rr: 1.25 },
+    { start: 0,    end: 600,  rr: 2.5 },   // nacht: peak 2.61 + journal +0.33 (n=14, geen 2x)
+    { start: 1400, end: 1900, rr: 1.5 },   // NY: TP op vloer, 2x size via RISK_WINDOWS
   ],
 };
 
 // ── Time blocks (per canonical ticker). DEMO (collect) IGNORES these. ──
 const TIME_BLOCK_WINDOWS = {
-  // US100
-  //   02-04u  n=10  EV -0.55  avg peak 0.54   -> NIEUW, dode chop
-  //   14-18u  n=20 vers (EV -0.50 / -0.17) + n=84-115 historisch, beide negatief
-  //   19-23u  n=11  EV -0.55  avg peak 0.44   -> NIEUW, laagste peak van de dag
-  "US100.cash": [{ start: 200,  end: 400  },
-                 { start: 1400, end: 1800 },
-                 { start: 1900, end: 2300 }],
-  // XAUUSD
-  //   10-12u  vers n=16 EV +0.12 (alleen op 1.0R) vs historisch n=81 EV -0.17/-0.31
-  //           -> gecombineerd bewijs leunt negatief, blijft DICHT. Laat de
-  //              optimizer dit heropenen als de verse data volhoudt.
-  //   15-17u  n=17  EV -0.41  -> dicht. (Dit venster is op 21 juli heropend na
-  //           één 6,32R-runner; de volledige dataset weerlegt dat. Hersteld.)
-  //   19-22u  n=19  EV -0.47  -> best onderbouwde blok van goud, ook historisch
-  "XAUUSD":     [{ start: 1000, end: 1200 },
-                 { start: 1500, end: 1700 },
-                 { start: 1900, end: 2200 }],
+  // GEEN blokkades — alle uren open. Sturing via TP + risk, niet via blocks.
 };
 
 // Symbols we explicitly refuse (other indices that must never be traded).
