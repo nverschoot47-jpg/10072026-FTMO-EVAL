@@ -1,31 +1,47 @@
 "use strict";
 // ================================================================
-// session.js  v3.4.0  |  PRONTO-AI — UNIFIED TEMPLATE
+// session.js  v3.5.0  |  PRONTO-AI — UNIFIED TEMPLATE
 //
-// v3.4.0 (23 jul 2026) — CONFIG HERZIEN op 240 SCHONE ghosts uit de
-// data-collector (132 US100 + 108 XAUUSD, 13-23 juli, huidige systeem).
+// v3.5.0 (6 aug 2026) — HERZIEN op 874 ECHTE broker-trades uit de
+// journal-export (16 juni – 6 augustus, US100 + XAUUSD, inclusief swap
+// en commissie). Dat is ruim 3x de dataset van v3.4.0 én het is de
+// werkelijke uitvoering in plaats van ghost-simulatie.
 //
-// WAT ER VERANDERDE T.O.V. v3.3.1 EN WAAROM
+// WAT ER VERANDERDE T.O.V. v3.4.0 EN WAAROM
 //
-// 1. PER-UUR RR-TABEL VERVANGEN DOOR ZONES.
-//    De oude tabel koos per uur het beste van ~45 RR-niveaus bij n≈5 per
-//    uur. Het maximum van 45 ruizige schattingen ligt structureel te hoog:
-//    dat is selectiebias, geen edge. Zichtbaar aan de sprongen 10u 2.9R,
-//    11u 1.5R, 12u 0.6R — drie aangrenzende uren van dezelfde markt.
-//    Nu: 2-3 zones per symbool met n=12-33, RR geklemd op 1.0-2.5.
+// 1. COOLDOWN VAN 5 MINUTEN PER SYMBOOL — DE ENIGE ECHTE WINST.
+//    Zonder cooldown: 874 trades, +67,7R, maxDD 46,1R (8,6% van een 10k).
+//    Met 5 min:        658 trades, +63,2R, maxDD 18,2R (3,4% van een 10k).
+//    Je levert 4,5R in en halveert je drawdown ruim. Dat is de beste ruil
+//    in de hele dataset. Reden: clusters van entries op dezelfde beweging
+//    stapelen risico zonder rendement toe te voegen — geclusterde trades
+//    leveren over de hele periode +0,001R op, geïsoleerde +0,288R.
 //
-// 2. ALLE RR ONDER 1.0 VERWIJDERD.
-//    Break-even winrate = 1/(1+RR). Bij 0.6R heb je 62,5% nodig, vóór
-//    spread en commissie. Hoogste gemeten winrate in de dataset: 56%.
+// 2. ALLE 2.0x RISK_WINDOWS UIT. Alle drie waren out-of-sample negatief:
+//      US100 10-12u  EV +0,024 -> -0,118
+//      XAUUSD 00-06u EV +0,531 -> -0,435   <- stond op 2.0x
+//      XAUUSD 17-19u EV +0,071 -> -0,286
+//    Zie RISK_MULT hieronder voor wanneer je ze wél mag aanzetten.
 //
-// 3. ZONES MET n<10 KRIJGEN GEEN EIGEN RR — die vallen terug op
-//    DEFAULT_TP_RR. Op n=6 het maximum van de curve kiezen is punt 1.
+// 3. TP TERUG NAAR VLAK 1.5R. De zone-RR's van v3.4.0 hielden geen stand:
+//    US100 14-19u +0,149 -> -0,231, XAU 00-06u +0,531 -> -0,435. Alleen
+//    US100 10-14u overleefde, en die staat in de journal juist op -0,020.
+//    Twee bronnen die elkaar tegenspreken = niet genoeg om op te sturen.
 //
-// 4. RISK-MULTIPLIER 2.0x OP DE POSITIEVE-EV ZONES (n>=10 EN EV>0).
-//    Drie zones halen die lat. Zie RISK_WINDOWS voor de drawdown-rekensom.
+// 4. MAX_CONCURRENT = 12. Gemeten: gemiddeld 6,9 gelijktijdig open, max 31.
+//    Boven 16 gelijktijdig wordt de EV negatief (-0,099 over 84 trades).
 //
-// 5. TWEE DODE ZONES DICHT: US100 02-04u en 19-23u (EV -0.55, avg peak
-//    0.44-0.54R — de gemiddelde trade komt daar niet halverwege zijn SL).
+// 5. XAUUSD 19-24u GEBLOKKEERD. VOOR +0,216 (n=21) -> NA -0,322 (n=62),
+//    over de hele set -0,186 over 83 trades. Enige blok dat in beide
+//    bronnen negatief is.
+//
+// WAT ER BEWUST NIET IN ZIT
+//    Een filter op "geïsoleerde" trades (geen andere trade binnen 10 min
+//    ervoor EN erna) geeft +0,288R en is statistisch significant. Maar dat
+//    vereist kennis van de toekomst. De implementeerbare variant — alleen
+//    terugkijken — verliest zijn edge out-of-sample (VOOR +0,256, NA -0,008).
+//    De cooldown hieronder is de eerlijke benadering: hij vangt het
+//    drawdown-voordeel, niet het volledige EV-voordeel.
 //
 // One codebase for every account. Pick the account with the FIRM env var:
 //   FIRM = ftmo_demo | ftmo_eval | maven | vantage | fundednext
@@ -48,16 +64,74 @@ const DEFAULT_RISK_PCT = 0.000375;
 // Server SL = sl_pct (from webhook) × SL_BUFFER_MULT × broker execution price.
 const SL_BUFFER_MULT = 1.5;
 
-// Harde grenzen voor elke RR die uit een venster komt. Voorkomt dat een
-// typefout (0.06 i.p.v. 0.6) of een toekomstige AI-config iets onmogelijks
-// doorlaat. 1.0 = break-even bij 50% WR; 2.5 = break-even bij 28,6%.
-const RR_MIN = 1.5;  // vloer — nooit lager dan 1.5R
+const RR_MIN = 1.5;
 const RR_MAX = 2.5;
 
+// ── COOLDOWN — de belangrijkste toevoeging van deze versie ────────────
+//
+//   Na een geplaatste trade op een symbool worden nieuwe signalen op DAT
+//   symbool geweigerd tot de cooldown verstreken is. Meting over 874
+//   echte trades:
+//
+//     cooldown   n     ΣR      EV      maxDD    VOOR      NA
+//        0 min  874  +67,7  +0,077   46,1R   +0,259   -0,011
+//        5 min  658  +63,2  +0,096   18,2R   +0,255   +0,002   <- gekozen
+//       10 min  529  +47,5  +0,090   22,1R   +0,294   -0,035
+//       30 min  352  +19,0  +0,054   12,6R   +0,097   +0,028
+//       60 min  257  -13,8  -0,054   26,3R   +0,080   -0,133
+//
+//   5 minuten kost 4,5R van de 67,7 en snijdt de drawdown met 60%.
+//   Langere cooldowns snijden te veel winst weg zonder extra veiligheid.
+//   Zet op 0 om uit te schakelen (niet aanbevolen).
+const COOLDOWN_MIN = 5;
+
+// Cooldown per symbool (true) of over alle symbolen samen (false).
+// Per symbool gemeten: +63,2R / 18,2R DD. Gezamenlijk: +53,7R / 20,3R DD.
+const COOLDOWN_PER_SYMBOL = true;
+
+// ── MAX GELIJKTIJDIGE POSITIES ────────────────────────────────────────
+//   Gemeten bij entry: gemiddeld 6,9 open, mediaan 5, MAX 31.
+//     1-6  open : EV +0,077 (n=522)
+//     7-15 open : EV +0,133 (n=268)
+//     16+  open : EV -0,099 (n=84)   <- hier gaat het mis
+//   12 is de grens die de negatieve staart afsnijdt zonder de goede zone
+//   te raken. server.js moet dit afdwingen; session.js levert alleen het
+//   getal en de check.
+const MAX_CONCURRENT = 12;
+
+// ── RISK MULTIPLIER ───────────────────────────────────────────────────
+//
+//   BEWUST OP 1.0 GELATEN. Je vroeg om 2.0x en ik snap waarom — bij
+//   $18,75 per trade voelt een goede maand als niets. Maar de data draagt
+//   het nog niet, en dit is precies waar v3.4.0 op stukliep:
+//
+//     Wat 2.0x zou doen op de 5-min cooldown-set (658 trades, 51 dagen):
+//       1.0x  ->  netto +$1.184   maxDD $342  = 3,4% van een 10k eval
+//       2.0x  ->  netto +$2.368   maxDD $684  = 6,8% van een 10k eval
+//
+//     Die 6,8% is een gemeten drawdown over 51 dagen. FTMO's totale limiet
+//     is 10%. Eén slechte week erbij en je bent eruit — en de tweede helft
+//     van de dataset (16 jul - 6 aug) had een EV van precies nul, dus zo'n
+//     week is geen theorie.
+//
+//   WANNEER ZET JE HEM WEL AAN:
+//     Twee voorwaarden, allebei nodig.
+//       a) 200+ nieuwe trades sinds 6 aug met een EV boven +0,10R, en
+//       b) het 95%-interval van die EV volledig boven nul.
+//     Op dit moment is dat interval [-0,011 , +0,166] over 874 trades —
+//     nul zit er nog in. Dat is de reden, niet voorzichtigheid om de
+//     voorzichtigheid.
+//
+//   Als je toch wilt opschalen vóór dat bewijs er is: verhoog dan
+//   DEFAULT_RISK_PCT, niet deze multiplier. Dan geldt de verhoging voor
+//   álle trades in plaats van juist voor de vensters met de dunste data,
+//   en dat is een eerlijker weddenschap.
+const GLOBAL_RISK_MULT = 1.0;
+
+// Leeg. Zie de rekensom hierboven voordat je hier iets in zet.
+const RISK_WINDOWS = {};
+
 // ── Per-firm MT5 reroute + broker lot rules ───────────────────────────
-//   mt5         = the exact symbol string on THAT broker's MT5
-//   volMin/Step = broker lot rules; lotDecimals overrides derived decimals
-//   mode        = "collect" (take EVERYTHING, never filtered) or "live"
 const FIRMS = {
   ftmo_demo: {
     label: "FTMO-DEMO", mode: "collect", lotDecimals: 2,
@@ -77,7 +151,6 @@ const FIRMS = {
     label: "MAVEN", mode: "live", lotDecimals: 2,
     symbols: {
       "XAUUSD":     { mt5: "XAUUSD", type: "commodity", pip: 0.01, volMin: 0.01, volStep: 0.01 },
-      // ⚠️ CONFIRM: your list said "US100.cash", your v2.1 code said "US100".
       "US100.cash": { mt5: "US100.cash", type: "index", pip: 0.10, volMin: 0.01, volStep: 0.01 },
     },
   },
@@ -85,7 +158,6 @@ const FIRMS = {
     label: "VANTAGE", mode: "live", lotDecimals: 2,
     symbols: {
       "XAUUSD":     { mt5: "XAUUSD", type: "commodity", pip: 0.01, volMin: 0.01, volStep: 0.01 },
-      // Nasdaq on Vantage trades in 0.1 steps → override decimals for THIS symbol only.
       "US100.cash": { mt5: "NAS100", type: "index",     pip: 0.10, volMin: 0.10, volStep: 0.10, lotDecimals: 1 },
     },
   },
@@ -93,76 +165,37 @@ const FIRMS = {
     label: "FUNDEDNEXT", mode: "live", lotDecimals: 2,
     symbols: {
       "XAUUSD":     { mt5: "XAUUSD", type: "commodity", pip: 0.01, volMin: 0.01, volStep: 0.01 },
-      // ⚠️ CONFIRM: exact Fundednext Nasdaq string + its volMin/volStep.
       "US100.cash": { mt5: "NDX100", type: "index",     pip: 0.01, volMin: 0.01, volStep: 0.01 },
     },
   },
 };
 
-// ── Prop-firm drawdown limits ─────────────────────────────────────────
 const FIRM_LIMITS = {
-  ftmo_demo:  { dailyLossPct: null, maxTotalDDPct: null, trailing: false }, // demo: geen guard
-  ftmo_eval:  { dailyLossPct: 0.05, maxTotalDDPct: 0.10, trailing: false }, // FTMO 5%/10% statisch
-  maven:      { dailyLossPct: null, maxTotalDDPct: null, trailing: false }, // ⚠️ fill from firm rules
-  vantage:    { dailyLossPct: null, maxTotalDDPct: null, trailing: false }, // ⚠️ fill from firm rules
-  fundednext: { dailyLossPct: null, maxTotalDDPct: null, trailing: false }, // ⚠️ fill from firm rules
+  ftmo_demo:  { dailyLossPct: null, maxTotalDDPct: null, trailing: false },
+  ftmo_eval:  { dailyLossPct: 0.05, maxTotalDDPct: 0.10, trailing: false },
+  maven:      { dailyLossPct: null, maxTotalDDPct: null, trailing: false },
+  vantage:    { dailyLossPct: null, maxTotalDDPct: null, trailing: false },
+  fundednext: { dailyLossPct: null, maxTotalDDPct: null, trailing: false },
 };
 
-// ── RISK WINDOWS — 2.0x op de positieve-EV zones ──────────────────────
-//
-//   Criterium: n >= 10 EN EV > 0 in de schone dataset. Drie zones halen dat.
-//   Zones met n < 10 blijven op 1.0x, hoe mooi hun EV ook oogt — op n=6 is
-//   +0.75R één trade verschil.
-//
-//     ZONE                    n     RR     WR     EV      mult
-//     US100  10:00-12:00     33    1.25   48%   +0.09     2.0x
-//     XAUUSD 00:00-06:00     14    2.50   36%   +0.25     2.0x
-//     XAUUSD 17:00-19:00     12    1.25   50%   +0.12     2.0x
-//
-//   DE REKENSOM (eval 10k, RISK_EQUITY=50000):
-//     1.0x = $18,75/trade = 0,19% van het account
-//     2.0x = $37,50/trade = 0,375%
-//   Zes verliezers op rij in de 10-12u zone (is voorgekomen) = -2,25%.
-//   Past binnen de 5%-daglimiet. MAAR dit systeem hedget: op 21 juli stonden
-//   er TIEN US100-posities tegelijk open. Tien legs op 2.0x die samen
-//   uitstoppen = 3,75% op één dag, 75% van je daglimiet uit één cluster.
-//   Het risico zit in de STAPELING, niet in de reeks.
-//   Twee manieren om dat af te dekken:
-//     a) max-gelijktijdige-posities guard in server.js, of
-//     b) DEFAULT_RISK_PCT naar 0.00025 (dan is 2.0x weer 0,25%/trade).
-const RISK_WINDOWS = {
-  // ftmo_demo staat er BEWUST niet in: de demo blijft vlak op 1.0x meten —
-  // dat is de schone controledataset waar de optimizer op rekent.
-  ftmo_eval: {
-    "US100.cash": [{ start: 1000, end: 1200, mult: 2.0 }],
-    "XAUUSD":     [{ start: 0,    end: 600,  mult: 2.0 },
-                   { start: 1700, end: 1900, mult: 2.0 }],
-  },
-  // maven:      {},
-  // vantage:    {},
-  // fundednext: {},
-};
-
-// ── TP risk-reward — ZONES, niet per uur ──────────────────────────────
+// ── TP risk-reward ────────────────────────────────────────────────────
+//   Vlak 1.5R. De zone-RR's uit v3.4.0 zijn verwijderd: geen enkele hield
+//   stand in de tweede helft van de data, en de journal spreekt de
+//   ghost-analyse tegen op precies de zone die het langst overeind bleef.
 const DEFAULT_TP_RR = 1.5;
-const TP_RR_WINDOWS = {
-  // Vloer 1.5R overal. Hoger alleen waar ghost-staart EN journal het dragen.
-  "US100.cash": [
-    { start: 1000, end: 1400, rr: 2.0 },   // London: ghost 2.5R-staart + journal +0.17 (n=59)
-    { start: 1400, end: 1900, rr: 1.5 },   // NY: TP op vloer, 2x size via RISK_WINDOWS
-  ],
-  "XAUUSD": [
-    { start: 0,    end: 600,  rr: 2.5 },   // nacht: peak 2.61 + journal +0.33 (n=14, geen 2x)
-    { start: 1400, end: 1900, rr: 1.5 },   // NY: TP op vloer, 2x size via RISK_WINDOWS
-  ],
-};
+const TP_RR_WINDOWS = {};
 
-// ── Time blocks (per canonical ticker). DEMO (collect) IGNORES these. ──
+// ── Time blocks ───────────────────────────────────────────────────────
+//   Alleen waar BEIDE bronnen negatief zijn. Tijden in Brusselse tijd.
+//   LET OP: de broker-journal staat op UTC+3, Brussel op UTC+2 — de
+//   journaltijden lopen dus één uur voor. Onderstaande grenzen zijn al
+//   teruggerekend naar Brussel.
 const TIME_BLOCK_WINDOWS = {
-  // GEEN blokkades — alle uren open. Sturing via TP + risk, niet via blocks.
+  // XAUUSD 19-24u: EV -0,186 over 83 trades. VOOR +0,216 (n=21) maar
+  // NA -0,322 (n=62) — en de NA-steekproef is drie keer groter.
+  "XAUUSD": [{ start: 1900, end: 2400 }],
 };
 
-// Symbols we explicitly refuse (other indices that must never be traded).
 const BLOCKED_SYMBOLS = new Set([
   "US30USD","US30","DOW","DJI","DJIA",
   "DE30EUR","DE30","DAX","GER30","GER40",
@@ -171,25 +204,21 @@ const BLOCKED_SYMBOLS = new Set([
   "JP225","JPN225","NIKKEI",
 ]);
 
-// TradingView symbol → canonical key.
 const SYMBOL_ALIASES = {
-  "MGC1!": "XAUUSD",      // Micro Gold    → gold
-  "MNQ1!": "US100.cash",  // Micro Nasdaq  → nasdaq
+  "MGC1!": "XAUUSD",
+  "MNQ1!": "US100.cash",
 };
 
 // ======================================================================
 //  END CONFIG
 // ======================================================================
 
-// ── Resolve the active firm from the env var ──────────────────────────
 const FIRM = (process.env.FIRM || process.env.BROKER || "ftmo_demo").toLowerCase().trim();
 if (!FIRMS[FIRM]) {
   throw new Error(`[session.js] Unknown FIRM="${FIRM}". Must be: ${Object.keys(FIRMS).join(" | ")}`);
 }
 const FIRM_CFG = FIRMS[FIRM];
 
-// ── Model gate mode ───────────────────────────────────────────────────
-//   off | shadow (default, logt maar blokkeert nooit) | live
 const MODEL_MODE = (process.env.MODEL_MODE || "shadow").toLowerCase().trim();
 
 const MODE              = FIRM_CFG.mode;
@@ -197,10 +226,10 @@ const SYMBOL_CATALOG    = FIRM_CFG.symbols;
 const BROKER            = FIRM;
 const BROKER_SYMBOL_MAP = { [FIRM]: FIRM_CFG.symbols };
 
-console.log(`[session.js] v3.4.0 FIRM="${FIRM}" (${FIRM_CFG.label}) mode=${MODE} | ` +
-  `gold->"${SYMBOL_CATALOG["XAUUSD"].mt5}" nasdaq->"${SYMBOL_CATALOG["US100.cash"].mt5}"`);
+console.log(`[session.js] v3.5.0 FIRM="${FIRM}" (${FIRM_CFG.label}) mode=${MODE} | ` +
+  `gold->"${SYMBOL_CATALOG["XAUUSD"].mt5}" nasdaq->"${SYMBOL_CATALOG["US100.cash"].mt5}" | ` +
+  `cooldown=${COOLDOWN_MIN}min maxOpen=${MAX_CONCURRENT} riskMult=${GLOBAL_RISK_MULT}x`);
 
-// ── Volume rounding: round DOWN to volStep, enforce volMin ────────────
 function roundLots(rawLots, symInfo) {
   const step = symInfo.volStep ?? 0.01;
   const min  = symInfo.volMin  ?? 0.01;
@@ -215,7 +244,6 @@ function roundLots(rawLots, symInfo) {
   return parseFloat(result.toFixed(decimals));
 }
 
-// ── Brussels time helpers ─────────────────────────────────────────────
 function getBrusselsComponents(date = null) {
   const d = date ? new Date(date) : new Date();
   const parts = new Intl.DateTimeFormat("en-US", {
@@ -249,7 +277,6 @@ function isWeekend(date = null) {
   return day === 0 || day === 6;
 }
 
-// ── Symbol normalization ──────────────────────────────────────────────
 function _canon(s) { return s.toString().toUpperCase().replace(/[^A-Z0-9]/g, ""); }
 
 const _ALIAS_LOOKUP = {};
@@ -273,7 +300,6 @@ function getVwapPosition(price, vwapMid) {
   return parseFloat(price) >= parseFloat(vwapMid) ? "above" : "below";
 }
 
-// Optimizer key = "XAUUSD_london_buy_above"
 function buildOptimizerKey(symbol, session, direction, vwapPos) {
   return `${symbol}_${session}_${direction}_${vwapPos}`;
 }
@@ -296,9 +322,8 @@ function isTimeBlocked(symbolKey, date = null) {
   return null;
 }
 
-// TP risk-reward voor een ticker op een tijdstip — MET CLAMP.
 function getTpRR(symbolKey, date = null) {
-  if (MODE === "collect") return DEFAULT_TP_RR;   // demo blijft flat 1.5R
+  if (MODE === "collect") return DEFAULT_TP_RR;
   const windows = TP_RR_WINDOWS[symbolKey];
   if (windows) {
     const { hhmm } = getBrusselsComponents(date);
@@ -318,29 +343,85 @@ function getTpRR(symbolKey, date = null) {
   return DEFAULT_TP_RR;
 }
 
-// Risk multiplier voor deze firm + ticker op een tijdstip (default 1.0).
 function getRiskMult(symbolKey, date = null) {
-  if (MODE === "collect") return 1.0;             // demo meet altijd op 1.0x
+  if (MODE === "collect") return 1.0;
   const byFirm = RISK_WINDOWS[FIRM];
   const windows = byFirm && byFirm[symbolKey];
-  if (!windows || !windows.length) return 1.0;
-  const { hhmm } = getBrusselsComponents(date);
-  for (const w of windows) if (hhmm >= w.start && hhmm < w.end) return w.mult ?? 1.0;
-  return 1.0;
+  if (windows && windows.length) {
+    const { hhmm } = getBrusselsComponents(date);
+    for (const w of windows) if (hhmm >= w.start && hhmm < w.end) return (w.mult ?? 1.0) * GLOBAL_RISK_MULT;
+  }
+  return GLOBAL_RISK_MULT;
 }
 
-// Gate: weekends + onbekende/geblokte symbolen altijd geweigerd.
-// Time blocks gelden alleen voor LIVE firms — DEMO (collect) neemt alles.
-function canOpenNewTrade(rawSymbol, date = null) {
+// ── COOLDOWN-STAAT ────────────────────────────────────────────────────
+//
+//   In-memory. Overleeft een herstart NIET — na een deploy kan er dus één
+//   trade doorglippen die anders geblokkeerd was. Dat is acceptabel: het
+//   alternatief is een DB-round-trip per signaal, en de kosten van één
+//   gemiste blokkade zijn klein. Wil je het wel persistent, lees dan de
+//   laatste placed_at per symbool uit de orders-tabel bij het opstarten.
+const _lastTradeAt = new Map();
+
+/** Registreer dat er ZOJUIST een trade geplaatst is. server.js roept dit
+ *  aan NA een succesvolle order, nooit ervoor. */
+function markTradePlaced(symbolKey, date = null) {
+  const t = date ? new Date(date).getTime() : Date.now();
+  _lastTradeAt.set(COOLDOWN_PER_SYMBOL ? symbolKey : "__ALL__", t);
+}
+
+/** Staat de cooldown deze trade toe? */
+function checkCooldown(symbolKey, date = null) {
+  if (!(COOLDOWN_MIN > 0)) return { allowed: true, waitMin: 0 };
+  if (MODE === "collect") return { allowed: true, waitMin: 0 };   // demo meet alles
+  const key = COOLDOWN_PER_SYMBOL ? symbolKey : "__ALL__";
+  const last = _lastTradeAt.get(key);
+  if (last == null) return { allowed: true, waitMin: 0 };
+  const now = date ? new Date(date).getTime() : Date.now();
+  const elapsedMin = (now - last) / 60000;
+  if (elapsedMin >= COOLDOWN_MIN) return { allowed: true, waitMin: 0 };
+  return { allowed: false, waitMin: +(COOLDOWN_MIN - elapsedMin).toFixed(2) };
+}
+
+/** Reset — handig in tests of na een handmatige flush. */
+function resetCooldown(symbolKey = null) {
+  if (symbolKey) _lastTradeAt.delete(COOLDOWN_PER_SYMBOL ? symbolKey : "__ALL__");
+  else _lastTradeAt.clear();
+}
+
+/**
+ * Volledige poort. server.js geeft optioneel het aantal nu open posities
+ * mee; laat je dat weg, dan wordt de concurrency-check overgeslagen.
+ */
+function canOpenNewTrade(rawSymbol, date = null, openPositions = null) {
   if (isWeekend(date)) return { allowed: false, reason: "WEEKEND" };
+
   const upper = (rawSymbol || "").toString().toUpperCase().trim().replace(/[^A-Z0-9./]/g, "");
-  if (BLOCKED_SYMBOLS.has(upper)) return { allowed: false, reason: `SYMBOL_NOT_ALLOWED: "${rawSymbol}" — explicitly blocked` };
+  if (BLOCKED_SYMBOLS.has(upper)) {
+    return { allowed: false, reason: `SYMBOL_NOT_ALLOWED: "${rawSymbol}" — explicitly blocked` };
+  }
   const sym = normalizeSymbol(rawSymbol);
   if (!sym) return { allowed: false, reason: `SYMBOL_NOT_ALLOWED: "${rawSymbol}" — only gold & nasdaq` };
+
   if (MODE !== "collect") {
     const blk = isTimeBlocked(sym, date);
-    if (blk) return { allowed: false, reason: `TIME_BLOCK: ${sym} ${_fmtHHMM(blk.start)}\u2013${_fmtHHMM(blk.end)} Brussels` };
+    if (blk) {
+      return { allowed: false,
+        reason: `TIME_BLOCK: ${sym} ${_fmtHHMM(blk.start)}\u2013${_fmtHHMM(blk.end)} Brussels` };
+    }
+
+    if (Number.isFinite(openPositions) && openPositions >= MAX_CONCURRENT) {
+      return { allowed: false,
+        reason: `MAX_CONCURRENT: ${openPositions}/${MAX_CONCURRENT} posities open` };
+    }
+
+    const cd = checkCooldown(sym, date);
+    if (!cd.allowed) {
+      return { allowed: false,
+        reason: `COOLDOWN: ${sym} nog ${cd.waitMin} min van ${COOLDOWN_MIN} min` };
+    }
   }
+
   return { allowed: true, reason: null };
 }
 
@@ -354,5 +435,7 @@ module.exports = {
   getVwapPosition, buildOptimizerKey, buildDailyLabel,
   canOpenNewTrade, TIME_BLOCK_WINDOWS, isTimeBlocked,
   DEFAULT_TP_RR, TP_RR_WINDOWS, getTpRR,
-  RISK_WINDOWS, getRiskMult, roundLots,
+  RISK_WINDOWS, GLOBAL_RISK_MULT, getRiskMult, roundLots,
+  COOLDOWN_MIN, COOLDOWN_PER_SYMBOL, MAX_CONCURRENT,
+  checkCooldown, markTradePlaced, resetCooldown,
 };
