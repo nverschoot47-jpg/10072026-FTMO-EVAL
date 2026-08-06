@@ -1,8 +1,8 @@
 "use strict";
 // ================================================================
-// session.js  v4.2.0  |  PRONTO-AI — UNIFIED TEMPLATE
+// session.js  v4.3.0  |  PRONTO-AI — UNIFIED TEMPLATE
 //
-// v4.2.0 (7 aug 2026) — HERZIEN op 307 handmatig uitgelezen ghost-rijen
+// v4.3.0 (7 aug 2026) — HERZIEN op 307 handmatig uitgelezen ghost-rijen
 // (22 juli - 6 augustus) plus 550 rijen uit de database.
 //
 // UITGANGSPUNT DAT ALLES BEPAALT: SL en TP staan VAST na plaatsing.
@@ -75,53 +75,52 @@ const TIMEZONE = "Europe/Brussels";
 
 // Risk per trade as a fraction of equity. 0.000375 = 0.0375%.
 // Met RISK_EQUITY=50000 -> $18,75 per trade op 1.0x.
-// ── RISICO PER TRADE ──────────────────────────────────────────────────
+// ── RISICO PER TRADE — VAST, GEEN PLAFOND ─────────────────────────────
 //
 //   LEES DIT VOORDAT JE HET RISICO VERHOOGT.
 //
 //   De EV van deze config is NIET aangetoond. Twee metingen op dezelfde
 //   strategie geven verschillende antwoorden:
-//
 //     307 handmatig uitgelezen rijen, RR 2.0, geen kanaalfilter:  EV +0,143
 //     223 database-rijen, RR 2.0, MET kanaalfilter + XAU-NY-blok: EV -0,004
+//   Als de filters werkten hoorde het tweede getal hoger te liggen. Dat het
+//   lager ligt betekent dat ze mogelijk willekeurig snijden. Daarom €20.
 //
-//   Als de filters werkten hoorde het tweede getal hoger te liggen dan het
-//   eerste. Dat het lager ligt betekent dat de filters mogelijk willekeurig
-//   snijden in plaats van de slechte trades te verwijderen. Ik weet niet
-//   welke van de twee metingen klopt.
-//
-//   Daarom staat de basis op €20 en niet op €40:
 //     €20/trade -> gemeten drawdown 24R = €480  (4,8% van een 10k eval)
-//     €40/trade -> €960                          (9,6% — tegen een 10%-limiet)
-//     €80/trade -> €1.920                        (onmogelijk)
+//     €40/trade -> €960                          (9,6% tegen een 10%-limiet)
 //
-//   Bij een EV die tussen 0,000 en +0,143 ligt, is €480 drawdown het
-//   verschil tussen doorleren en je account verliezen.
+//   VERHOOG NAAR €40 bij 200+ nieuwe trades met een EV boven +0,05R.
 //
-//   VERHOOG NAAR €40 wanneer je 200+ nieuwe trades hebt met een EV boven
-//   +0,05R. Tot die tijd is dit een meetperiode met echt geld, geen
-//   winstperiode.
+//   GEEN TOTAALPLAFOND EN GEEN POSITIELIMIET — bewust.
+//   Gemeten naar aantal gelijktijdig open posities:
+//     gelijktijdig    n    WR      EV
+//        1-4         54  33,3%   0,000
+//        5-8         60  30,0%  -0,100
+//        9-12        35  31,4%  -0,057
+//       13-18        58  39,7%  +0,190   <- de BESTE bak
+//       19+          16  25,0%  -0,250
+//   Een limiet op 12 zou precies de beste bak wegsnijden. Dat is ook
+//   logisch: veel gelijktijdige posities betekent dat de markt beweegt,
+//   en dat is wanneer deze strategie werkt. Een geweigerd signaal is een
+//   gemiste trade, en die kost meer dan de blootstelling.
 //
-//   Harde bovengrens blijft MAX_TOTAL_RISK_EUR aan gelijktijdig open risico.
-const MAX_TOTAL_RISK_EUR = 500;
-const RISK_EUR_BASE      = 20;
+//   Natuurlijke bovengrens: hoogst gemeten gelijktijdigheid is 21. Bij €20
+//   per trade is dat €420 — het plafond van €500 werd in de praktijk toch
+//   nooit geraakt, behalve om die goede bak te blokkeren.
+const RISK_EUR = 20;
 
-//   Staffel: op een rustige dag mag het risico omhoog, op een drukke terug.
-//   Gemeten: ~15,6 trades/dag na filters, ~7 gelijktijdig open.
-//     0-3 open  -> €40
-//     4-5 open  -> €30
-//     6+  open  -> €20
-const RISK_STAFFEL = [
-  { maxOpen: 3, eur: 40 },
-  { maxOpen: 5, eur: 30 },
-  { maxOpen: 99, eur: 20 },
-];
+//   Alleen als absolute noodrem, ver boven wat ooit gemeten is. Raakt hij,
+//   dan is er iets structureel mis (webhook-storm, dubbele deploy) en wil je
+//   dat wél weten.
+const NOODREM_POSITIES = 40;
 
-//   Achterwaartse compatibiliteit: server.js rekent nog met een fractie van
-//   RISK_EQUITY. Gebruik bij voorkeur getRiskEur() — die kent de staffel en
-//   het €500-plafond wel.
+//   Achterwaartse compatibiliteit voor server.js dat met een equity-fractie
+//   rekent. Gebruik bij voorkeur getRiskEur().
 const RISK_EQUITY_REF  = 50000;
-const DEFAULT_RISK_PCT = RISK_EUR_BASE / RISK_EQUITY_REF;   // 0.0004
+const DEFAULT_RISK_PCT = RISK_EUR / RISK_EQUITY_REF;   // 0.0004
+
+/** Risico in euro. Vast bedrag — geen staffel, geen plafond. */
+function getRiskEur() { return RISK_EUR; }
 
 // Server SL = sl_pct (from webhook) × SL_BUFFER_MULT × broker execution price.
 const SL_BUFFER_MULT = 1.5;
@@ -157,12 +156,8 @@ const COOLDOWN_MIN = 5;
 // Per symbool gemeten: +63,2R / 18,2R DD. Gezamenlijk: +53,7R / 20,3R DD.
 const COOLDOWN_PER_SYMBOL = true;
 
-// ── MAX GELIJKTIJDIGE POSITIES ────────────────────────────────────────
-//   Volgt uit het €500-plafond gedeeld door het risico per trade:
-//     €40 -> 12    €60 -> 8    €80 -> 6
-//   getRiskEur() rekent dit per trade uit; MAX_CONCURRENT is de harde stop
-//   voor het geval het risico op de basis (€40) staat.
-const MAX_CONCURRENT = Math.min(12, Math.floor(MAX_TOTAL_RISK_EUR / RISK_EUR_BASE));
+// Geen echte limiet meer — zie het risicoblok hierboven. Dit is de noodrem.
+const MAX_CONCURRENT = NOODREM_POSITIES;
 // Geklemd: boven 16 gelijktijdig werd de EV in elke meting negatief.
 
 
@@ -340,7 +335,7 @@ const SYMBOL_CATALOG    = FIRM_CFG.symbols;
 const BROKER            = FIRM;
 const BROKER_SYMBOL_MAP = { [FIRM]: FIRM_CFG.symbols };
 
-console.log(`[session.js] v4.2.0 FIRM="${FIRM}" (${FIRM_CFG.label}) mode=${MODE} | ` +
+console.log(`[session.js] v4.3.0 FIRM="${FIRM}" (${FIRM_CFG.label}) mode=${MODE} | ` +
   `gold->"${SYMBOL_CATALOG["XAUUSD"].mt5}" nasdaq->"${SYMBOL_CATALOG["US100.cash"].mt5}" | ` +
   `cooldown=${COOLDOWN_MIN}min maxOpen=${MAX_CONCURRENT} riskMult=${GLOBAL_RISK_MULT}x`);
 
@@ -524,23 +519,16 @@ function canOpenNewTrade(rawSymbol, date = null, openPositions = null, ctx = {})
         reason: `TIME_BLOCK: ${sym} ${_fmtHHMM(blk.start)}\u2013${_fmtHHMM(blk.end)} Brussels` };
     }
 
-    if (Number.isFinite(openPositions) && openPositions >= MAX_CONCURRENT) {
+    // Noodrem, geen normale limiet. Hoogst gemeten gelijktijdigheid is 21.
+    if (Number.isFinite(openPositions) && openPositions >= NOODREM_POSITIES) {
       return { allowed: false,
-        reason: `MAX_CONCURRENT: ${openPositions}/${MAX_CONCURRENT} posities open` };
+        reason: `NOODREM: ${openPositions} posities open (>${NOODREM_POSITIES}) — iets is mis` };
     }
 
     // Kanaalbreedte — de belangrijkste poort van deze versie.
     const chanR = ctx.chanR != null ? ctx.chanR : berekenChanR(ctx);
     const ch = chanROk(chanR);
     if (!ch.allowed) return { allowed: false, reason: ch.reason, chanR };
-
-    if (Number.isFinite(openPositions)) {
-      const eur = getRiskEur(openPositions);
-      if (!(eur > 0)) {
-        return { allowed: false, chanR,
-          reason: `MAX_TOTAL_RISK: ${openPositions} open, geen ruimte binnen €${MAX_TOTAL_RISK_EUR}` };
-      }
-    }
 
     const cd = checkCooldown(sym, date);
     if (!cd.allowed) {
@@ -551,7 +539,7 @@ function canOpenNewTrade(rawSymbol, date = null, openPositions = null, ctx = {})
 
   const chanR = ctx.chanR != null ? ctx.chanR : berekenChanR(ctx);
   return { allowed: true, reason: null, chanR,
-           riskEur: Number.isFinite(openPositions) ? getRiskEur(openPositions) : RISK_EUR_BASE,
+           riskEur: RISK_EUR,
            rr: DEFAULT_TP_RR };
 }
 
@@ -605,7 +593,7 @@ module.exports = {
   canOpenNewTrade, TIME_BLOCK_WINDOWS, isTimeBlocked,
   DEFAULT_TP_RR, TP_RR_WINDOWS, getTpRR,
   MIN_CHAN_R, berekenChanR, chanROk,
-  MAX_TOTAL_RISK_EUR, RISK_EUR_BASE, RISK_STAFFEL, getRiskEur, HANDMATIG,
+  RISK_EUR, NOODREM_POSITIES, getRiskEur, HANDMATIG,
   RISK_WINDOWS, GLOBAL_RISK_MULT, getRiskMult, roundLots,
   COOLDOWN_MIN, COOLDOWN_PER_SYMBOL, MAX_CONCURRENT,
   checkCooldown, markTradePlaced, resetCooldown,
