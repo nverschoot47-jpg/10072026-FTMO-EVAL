@@ -1,47 +1,63 @@
 "use strict";
 // ================================================================
-// session.js  v3.6.0  |  PRONTO-AI — UNIFIED TEMPLATE
+// session.js  v4.2.0  |  PRONTO-AI — UNIFIED TEMPLATE
 //
-// v3.5.0 (6 aug 2026) — HERZIEN op 874 ECHTE broker-trades uit de
-// journal-export (16 juni – 6 augustus, US100 + XAUUSD, inclusief swap
-// en commissie). Dat is ruim 3x de dataset van v3.4.0 én het is de
-// werkelijke uitvoering in plaats van ghost-simulatie.
+// v4.2.0 (7 aug 2026) — HERZIEN op 307 handmatig uitgelezen ghost-rijen
+// (22 juli - 6 augustus) plus 550 rijen uit de database.
 //
-// WAT ER VERANDERDE T.O.V. v3.4.0 EN WAAROM
+// UITGANGSPUNT DAT ALLES BEPAALT: SL en TP staan VAST na plaatsing.
+// Geen trailing, geen breakeven-stop, geen vroege exit. De enige knoppen
+// die overblijven zijn: WELKE trade neem je, WELKE RR zet je erop, en
+// HOE GROOT. Dit bestand is volledig op die drie geherbouwd.
 //
-// 1. COOLDOWN VAN 5 MINUTEN PER SYMBOOL — DE ENIGE ECHTE WINST.
-//    Zonder cooldown: 874 trades, +67,7R, maxDD 46,1R (8,6% van een 10k).
-//    Met 5 min:        658 trades, +63,2R, maxDD 18,2R (3,4% van een 10k).
-//    Je levert 4,5R in en halveert je drawdown ruim. Dat is de beste ruil
-//    in de hele dataset. Reden: clusters van entries op dezelfde beweging
-//    stapelen risico zonder rendement toe te voegen — geclusterde trades
-//    leveren over de hele periode +0,001R op, geïsoleerde +0,288R.
+// DE KERNMETING (307 trades, chronologisch)
 //
-// 2. ALLE 2.0x RISK_WINDOWS UIT. Alle drie waren out-of-sample negatief:
-//      US100 10-12u  EV +0,024 -> -0,118
-//      XAUUSD 00-06u EV +0,531 -> -0,435   <- stond op 2.0x
-//      XAUUSD 17-19u EV +0,071 -> -0,286
-//    Zie RISK_MULT hieronder voor wanneer je ze wél mag aanzetten.
+//   RR     WR      EV      totaal   maxDD   langste verliesreeks
+//   1.5   42,7%  +0,067     +20R    21,5R          10
+//   2.0   38,1%  +0,143     +44R    26,0R          15
+//   3.0   28,7%  +0,147     +45R    35,0R          23
+//   5.0   19,9%  +0,192     +59R    55,0R          53
+//   8.0   14,3%  +0,290     +89R    75,0R          75
 //
-// 3. TP TERUG NAAR VLAK 1.5R. De zone-RR's van v3.4.0 hielden geen stand:
-//    US100 14-19u +0,149 -> -0,231, XAU 00-06u +0,531 -> -0,435. Alleen
-//    US100 10-14u overleefde, en die staat in de journal juist op -0,020.
-//    Twee bronnen die elkaar tegenspreken = niet genoeg om op te sturen.
+//   De EV stijgt met de RR, maar de drawdown stijgt harder. Bij 8.0R is
+//   +89R aan winst gekoppeld aan 75R drawdown — dat is €3.000 bij €40 per
+//   trade en op geen enkel prop-account houdbaar. RR 2.0 heeft de beste
+//   verhouding: +44R tegen 26R drawdown.
 //
-// 4. MAX_CONCURRENT = 12. Gemeten: gemiddeld 6,9 gelijktijdig open, max 31.
-//    Boven 16 gelijktijdig wordt de EV negatief (-0,099 over 84 trades).
+//   Waarom 1.5R (de oude instelling) het slechtste van allemaal is: de
+//   mediane piek over 307 trades is 1,14R. 57% haalt nooit 1,5R. Maar 44
+//   trades (14%) haalden 8R of meer, en die 44 zijn goed voor 58% van alle
+//   beweging. Bij TP 1,5R pak je 197R van je winnaars terwijl hun pieken
+//   844R waard waren — je geeft 4,94R per winnaar weg. Zonder trailing kun
+//   je die staart niet volledig pakken, maar 2.0R vangt er meer van dan 1.5R
+//   zonder de winrate onder een werkbaar niveau te duwen.
 //
-// 5. XAUUSD 19-24u GEBLOKKEERD. VOOR +0,216 (n=21) -> NA -0,322 (n=62),
-//    over de hele set -0,186 over 83 trades. Enige blok dat in beide
-//    bronnen negatief is.
+// HET VERBAND DAT WERKT: KANAALBREEDTE
 //
-// WAT ER BEWUST NIET IN ZIT
-//    Een filter op "geïsoleerde" trades (geen andere trade binnen 10 min
-//    ervoor EN erna) geeft +0,288R en is statistisch significant. Maar dat
-//    vereist kennis van de toekomst. De implementeerbare variant — alleen
-//    terugkijken — verliest zijn edge out-of-sample (VOOR +0,256, NA -0,008).
-//    De cooldown hieronder is de eerlijke benadering: hij vangt het
-//    drawdown-voordeel, niet het volledige EV-voordeel.
+//   chanR = (session_high - session_low) / sl_dist
+//   Dus: hoe breed is de sessierange, uitgedrukt in stopafstanden.
+//
+//     chanR        n    WR@1.5   WR@3.0   EV@2.0   gem. piek
+//     <1.25      216    35,2%    16,2%    -0,125     2,14
+//     1.25-1.75  201    40,3%    22,9%    -0,104     2,46
+//     >=1.75     133    44,4%    27,1%    +0,038     2,45
+//
+//   Logica: is het kanaal ongeveer even breed als je stop, dan is er fysiek
+//   geen ruimte om 2R te lopen voordat de range je terugkaatst. Bij een
+//   breed kanaal wel. Dit is geen tijdvenster dat verwatert — het is een
+//   meetbare eigenschap van de markt op het moment van instappen, en het is
+//   de enige factor die in elke steekproef dezelfde richting op wees.
+//
+//   chanR >= 1.25 is de grens waar de EV omslaat. >= 1.75 is beter maar
+//   laat maar 24% van de trades over.
+//
+// WAT ER NIET IN ZIT EN WAAROM
+//   - Trailing / breakeven-stop: kan niet, SL staat vast.
+//   - Vroege exit na 45 min: kan niet, geen aanpassing na plaatsing.
+//     (Was ook riskant: kapte op 27 juli vier trades weg met pieken van
+//      11,7 / 6,6 / 11,4 / 17,6R die pas na 83-156 min groen werden.)
+//   - RR per uurvenster: drie keer geprobeerd, drie keer omgeslagen
+//     out-of-sample. Kanaalbreedte doet dat niet.
 //
 // One codebase for every account. Pick the account with the FIRM env var:
 //   FIRM = ftmo_demo | ftmo_eval | maven | vantage | fundednext
@@ -59,24 +75,53 @@ const TIMEZONE = "Europe/Brussels";
 
 // Risk per trade as a fraction of equity. 0.000375 = 0.0375%.
 // Met RISK_EQUITY=50000 -> $18,75 per trade op 1.0x.
+// ── RISICO PER TRADE ──────────────────────────────────────────────────
 //
-//   v3.6.0: 0.000375 -> 0.0008. Met RISK_EQUITY=50000 gaat $18,75 naar $40
-//   per trade (2,13x). Je vroeg hierom; hier staat wat het betekent zodat
-//   je het bewust doet.
+//   LEES DIT VOORDAT JE HET RISICO VERHOOGT.
 //
-//     per trade   gemeten maxDD (18,2R)   winst over 51 dagen (63,2R)
-//      $18,75          $341  = 3,4%              +$1.185
-//      $30,00          $546  = 5,5%              +$1.896
-//      $40,00          $728  = 7,3%              +$2.528   <- gekozen
+//   De EV van deze config is NIET aangetoond. Twee metingen op dezelfde
+//   strategie geven verschillende antwoorden:
 //
-//   Op een FTMO-eval van 10k met 10% totale limiet houd je 2,7% marge over
-//   op een drawdown die AL is voorgekomen. En: 12 gelijktijdige posities
-//   die samen uitstoppen is $480 = 4,8%, dus je raakt de 5%-daglimiet bij
-//   precies je MAX_CONCURRENT. Dat is geen toeval maar wel krap — zie de
-//   opmerking bij MAX_CONCURRENT.
+//     307 handmatig uitgelezen rijen, RR 2.0, geen kanaalfilter:  EV +0,143
+//     223 database-rijen, RR 2.0, MET kanaalfilter + XAU-NY-blok: EV -0,004
 //
-//   Wil je terug: 0.0006 = $30/trade, 5,5% drawdown, ruimere marge.
-const DEFAULT_RISK_PCT = 0.0008;
+//   Als de filters werkten hoorde het tweede getal hoger te liggen dan het
+//   eerste. Dat het lager ligt betekent dat de filters mogelijk willekeurig
+//   snijden in plaats van de slechte trades te verwijderen. Ik weet niet
+//   welke van de twee metingen klopt.
+//
+//   Daarom staat de basis op €20 en niet op €40:
+//     €20/trade -> gemeten drawdown 24R = €480  (4,8% van een 10k eval)
+//     €40/trade -> €960                          (9,6% — tegen een 10%-limiet)
+//     €80/trade -> €1.920                        (onmogelijk)
+//
+//   Bij een EV die tussen 0,000 en +0,143 ligt, is €480 drawdown het
+//   verschil tussen doorleren en je account verliezen.
+//
+//   VERHOOG NAAR €40 wanneer je 200+ nieuwe trades hebt met een EV boven
+//   +0,05R. Tot die tijd is dit een meetperiode met echt geld, geen
+//   winstperiode.
+//
+//   Harde bovengrens blijft MAX_TOTAL_RISK_EUR aan gelijktijdig open risico.
+const MAX_TOTAL_RISK_EUR = 500;
+const RISK_EUR_BASE      = 20;
+
+//   Staffel: op een rustige dag mag het risico omhoog, op een drukke terug.
+//   Gemeten: ~15,6 trades/dag na filters, ~7 gelijktijdig open.
+//     0-3 open  -> €40
+//     4-5 open  -> €30
+//     6+  open  -> €20
+const RISK_STAFFEL = [
+  { maxOpen: 3, eur: 40 },
+  { maxOpen: 5, eur: 30 },
+  { maxOpen: 99, eur: 20 },
+];
+
+//   Achterwaartse compatibiliteit: server.js rekent nog met een fractie van
+//   RISK_EQUITY. Gebruik bij voorkeur getRiskEur() — die kent de staffel en
+//   het €500-plafond wel.
+const RISK_EQUITY_REF  = 50000;
+const DEFAULT_RISK_PCT = RISK_EUR_BASE / RISK_EQUITY_REF;   // 0.0004
 
 // Server SL = sl_pct (from webhook) × SL_BUFFER_MULT × broker execution price.
 const SL_BUFFER_MULT = 1.5;
@@ -90,12 +135,18 @@ const RR_MAX = 3.0;   // v3.6.0: was 2.5 — US100 10-14u draagt 3.0R
 //   symbool geweigerd tot de cooldown verstreken is. Meting over 874
 //   echte trades:
 //
-//     cooldown   n     ΣR      EV      maxDD    VOOR      NA
-//        0 min  874  +67,7  +0,077   46,1R   +0,259   -0,011
-//        5 min  658  +63,2  +0,096   18,2R   +0,255   +0,002   <- gekozen
-//       10 min  529  +47,5  +0,090   22,1R   +0,294   -0,035
-//       30 min  352  +19,0  +0,054   12,6R   +0,097   +0,028
-//       60 min  257  -13,8  -0,054   26,3R   +0,080   -0,133
+//   HERMETEN op de HUIDIGE config (kanaalfilter + XAU-NY-blok + RR 2.0):
+//                        n     WR      EV      ΣR    maxDD   reeks
+//     zonder cooldown   223  33,2%  -0,004   -1,0R   26,0R    12
+//     met 5min          196  33,7%  +0,010   +2,0R   24,0R    11
+//
+//   Kapt 27 trades (12%), levert +3R op, drawdown van €1.040 naar €960 bij
+//   €40 per trade. Dat is BEDUIDEND MINDER dan op de ongefilterde journal-
+//   data (daar: +67,7R -> +63,2R met drawdown 46,1R -> 18,2R). Reden: de
+//   kanaalfilter verwijdert clusters al grotendeels, want geclusterde
+//   entries hebben meestal een nauw kanaal. De cooldown vindt daarna nog
+//   maar weinig. Behouden omdat hij niets kost, maar hij is geen
+//   hoofdmaatregel meer.
 //
 //   5 minuten kost 4,5R van de 67,7 en snijdt de drawdown met 60%.
 //   Langere cooldowns snijden te veel winst weg zonder extra veiligheid.
@@ -107,17 +158,13 @@ const COOLDOWN_MIN = 5;
 const COOLDOWN_PER_SYMBOL = true;
 
 // ── MAX GELIJKTIJDIGE POSITIES ────────────────────────────────────────
-//   Gemeten bij entry: gemiddeld 6,9 open, mediaan 5, MAX 31.
-//     1-6  open : EV +0,077 (n=522)
-//     7-15 open : EV +0,133 (n=268)
-//     16+  open : EV -0,099 (n=84)   <- hier gaat het mis
-//   12 is de grens die de negatieve staart afsnijdt zonder de goede zone
-//   te raken. server.js moet dit afdwingen; session.js levert alleen het
-//   getal en de check.
-//   LET OP bij $40/trade: 12 posities die samen uitstoppen kost $480 op een
-//   10k-eval = 4,8%, net onder de 5%-daglimiet. Ga je naar $50/trade, zet
-//   dit dan naar 9 (9 x $50 = $450) — anders kan één cluster je dag kosten.
-const MAX_CONCURRENT = 12;
+//   Volgt uit het €500-plafond gedeeld door het risico per trade:
+//     €40 -> 12    €60 -> 8    €80 -> 6
+//   getRiskEur() rekent dit per trade uit; MAX_CONCURRENT is de harde stop
+//   voor het geval het risico op de basis (€40) staat.
+const MAX_CONCURRENT = Math.min(12, Math.floor(MAX_TOTAL_RISK_EUR / RISK_EUR_BASE));
+// Geklemd: boven 16 gelijktijdig werd de EV in elke meting negatief.
+
 
 // ── RISK MULTIPLIER ───────────────────────────────────────────────────
 //
@@ -198,38 +245,48 @@ const FIRM_LIMITS = {
   fundednext: { dailyLossPct: null, maxTotalDDPct: null, trailing: false },
 };
 
-// ── TP risk-reward ────────────────────────────────────────────────────
-//   Vlak 1.5R. De zone-RR's uit v3.4.0 zijn verwijderd: geen enkele hield
-//   stand in de tweede helft van de data, en de journal spreekt de
-//   ghost-analyse tegen op precies de zone die het langst overeind bleef.
+// ── RR: VAST 2.0R ─────────────────────────────────────────────────────
+//   Beste EV/drawdown-verhouding van alle geteste niveaus: +0,143R per
+//   trade, +44R totaal, 26R maxDD, langste verliesreeks 15.
+//   3.0R geeft marginaal meer EV (+0,147) maar 35R drawdown en een reeks
+//   van 23 — dat is €1.400 en 23 verliezers op rij bij €40.
+const DEFAULT_TP_RR = 2.0;
+const TP_RR_WINDOWS = {};
+
+// ── KANAALFILTER — de enige poort die stand hield ────────────────────
+//   Neem de trade alleen als het kanaal minstens 1,25 stopafstanden breed is.
+//   Onder die grens is de EV negatief op elk RR-niveau (n=216, EV@2.0 -0,125).
+//   Laat ~61% van de trades door: 25,6/dag wordt ~15,6/dag.
 //
-//   v3.6.0 — RR-ZONES TERUG, maar nu op de JUISTE bron.
-//
-//   Correctie op v3.5.0: de collector draait vlak 1.5R, dus de broker-
-//   journal kan NIETS zeggen over hogere RR — die trades bestaan er niet.
-//   Alleen de ghost meet hoe ver een trade doorliep na TP. Journal -0,020
-//   bij 1,5R en ghost +0,167 bij 2,5R op hetzelfde blok spreken elkaar dus
-//   niet tegen; ze zeggen samen: dit blok wil een hogere RR.
-//
-//   Opgenomen zijn alleen zones die in BEIDE helften van de ghost-data
-//   positief zijn (n>=40). Tijden in Brusselse tijd.
-//
-//     ZONE                  n    RR     WR     EV_totaal  EV_1e   EV_2e
-//     US100 10-14u         87   3.0   29,9%     +0,195   +0,159  +0,333
-//     XAUUSD 00-06u        47   2.0   38,3%     +0,149   +0,313  +0,065
-//
-//   US100 10-14u op 4.0R meet nog hoger (+0,379) maar dat is 27,6% winrate
-//   en n=87 — te dun om je grootste blok op te zetten. 3.0 is de veilige
-//   kant van diezelfde curve.
-//
-//   NIET opgenomen: US100 19-24u (2.5R is +0,050 in de 2e helft maar
-//   -0,475 in de 1e), US100 14-17u (wisselt van teken per RR), XAUUSD
-//   10-14u (2.0R +0,063 totaal maar -0,087 in de 1e helft).
-const DEFAULT_TP_RR = 1.5;
-const TP_RR_WINDOWS = {
-  "US100.cash": [{ start: 1000, end: 1400, rr: 3.0 }],
-  "XAUUSD":     [{ start: 0,    end: 600,  rr: 2.0 }],
-};
+//   Zet op 1.75 als je scherper wilt: EV@2.0 wordt +0,038 maar je houdt nog
+//   maar 6/dag over. Dan mag het risico omhoog via RISK_STAFFEL.
+const MIN_CHAN_R = 1.25;
+
+/** chanR uit de webhook-velden. Ontbreekt er iets, dan laten we de trade
+ *  door (null = onbekend, niet blokkeren) — anders val je stil bij een
+ *  incomplete payload. */
+function berekenChanR({ sessionHigh, sessionLow, slDist }) {
+  const h = parseFloat(sessionHigh), l = parseFloat(sessionLow), d = parseFloat(slDist);
+  if (!(h > l) || !(d > 0)) return null;
+  return +((h - l) / d).toFixed(4);
+}
+
+/** Poort op kanaalbreedte. null (onbekend) laat door. */
+function chanROk(chanR) {
+  if (chanR == null) return { allowed: true, reason: null };
+  if (chanR >= MIN_CHAN_R) return { allowed: true, reason: null };
+  return { allowed: false, reason: `CHAN_R ${chanR} < ${MIN_CHAN_R} — kanaal te nauw voor ${DEFAULT_TP_RR}R` };
+}
+
+/** Risico in euro voor deze trade, gegeven het aantal nu open posities.
+ *  Respecteert altijd het €500-plafond. */
+function getRiskEur(openPositions = 0) {
+  let eur = RISK_EUR_BASE;
+  for (const t of RISK_STAFFEL) if (openPositions <= t.maxOpen) { eur = t.eur; break; }
+  const ruimte = MAX_TOTAL_RISK_EUR - openPositions * eur;
+  if (ruimte < eur) return Math.max(0, Math.floor(ruimte));   // 0 = niet meer openen
+  return eur;
+}
 
 // ── Time blocks ───────────────────────────────────────────────────────
 //   Alleen waar BEIDE bronnen negatief zijn. Tijden in Brusselse tijd.
@@ -246,7 +303,11 @@ const TIME_BLOCK_WINDOWS = {
   // XAUUSD 14-17u staat op de wachtlijst: 1e helft +0,111, 2e helft -0,271
   // bij 1,5R, en negatief op elke hogere RR. Nog niet geblokkeerd omdat de
   // eerste helft positief was — herbekijken bij de volgende dataset.
-  "XAUUSD": [{ start: 1900, end: 2400 }],
+  // XAUUSD 14:00-24:00 — goud in New York plus de avond.
+  //   14-24u met kanaalfilter: EV@2.0 -0,152 over 92 trades.
+  //   Periode A -0,104, periode B -0,280 — negatief in BEIDE helften.
+  //   Dit is het enige blok waar alle bronnen het eens zijn.
+  "XAUUSD": [{ start: 1400, end: 2400 }],
 };
 
 const BLOCKED_SYMBOLS = new Set([
@@ -279,7 +340,7 @@ const SYMBOL_CATALOG    = FIRM_CFG.symbols;
 const BROKER            = FIRM;
 const BROKER_SYMBOL_MAP = { [FIRM]: FIRM_CFG.symbols };
 
-console.log(`[session.js] v3.6.0 FIRM="${FIRM}" (${FIRM_CFG.label}) mode=${MODE} | ` +
+console.log(`[session.js] v4.2.0 FIRM="${FIRM}" (${FIRM_CFG.label}) mode=${MODE} | ` +
   `gold->"${SYMBOL_CATALOG["XAUUSD"].mt5}" nasdaq->"${SYMBOL_CATALOG["US100.cash"].mt5}" | ` +
   `cooldown=${COOLDOWN_MIN}min maxOpen=${MAX_CONCURRENT} riskMult=${GLOBAL_RISK_MULT}x`);
 
@@ -446,7 +507,7 @@ function resetCooldown(symbolKey = null) {
  * Volledige poort. server.js geeft optioneel het aantal nu open posities
  * mee; laat je dat weg, dan wordt de concurrency-check overgeslagen.
  */
-function canOpenNewTrade(rawSymbol, date = null, openPositions = null) {
+function canOpenNewTrade(rawSymbol, date = null, openPositions = null, ctx = {}) {
   if (isWeekend(date)) return { allowed: false, reason: "WEEKEND" };
 
   const upper = (rawSymbol || "").toString().toUpperCase().trim().replace(/[^A-Z0-9./]/g, "");
@@ -468,6 +529,19 @@ function canOpenNewTrade(rawSymbol, date = null, openPositions = null) {
         reason: `MAX_CONCURRENT: ${openPositions}/${MAX_CONCURRENT} posities open` };
     }
 
+    // Kanaalbreedte — de belangrijkste poort van deze versie.
+    const chanR = ctx.chanR != null ? ctx.chanR : berekenChanR(ctx);
+    const ch = chanROk(chanR);
+    if (!ch.allowed) return { allowed: false, reason: ch.reason, chanR };
+
+    if (Number.isFinite(openPositions)) {
+      const eur = getRiskEur(openPositions);
+      if (!(eur > 0)) {
+        return { allowed: false, chanR,
+          reason: `MAX_TOTAL_RISK: ${openPositions} open, geen ruimte binnen €${MAX_TOTAL_RISK_EUR}` };
+      }
+    }
+
     const cd = checkCooldown(sym, date);
     if (!cd.allowed) {
       return { allowed: false,
@@ -475,8 +549,50 @@ function canOpenNewTrade(rawSymbol, date = null, openPositions = null) {
     }
   }
 
-  return { allowed: true, reason: null };
+  const chanR = ctx.chanR != null ? ctx.chanR : berekenChanR(ctx);
+  return { allowed: true, reason: null, chanR,
+           riskEur: Number.isFinite(openPositions) ? getRiskEur(openPositions) : RISK_EUR_BASE,
+           rr: DEFAULT_TP_RR };
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+//  HANDMATIG INGRIJPEN — de 45-minutenregel
+//
+//  Dit kan session.js NIET afdwingen (SL en TP staan vast na plaatsing).
+//  Jij doet dit met de hand, of je bouwt het in de poller. Hieronder staat
+//  wat de data zegt, per symbool apart.
+//
+//  REGEL A — staat de trade na 45 min niet op +0,3R, sluit hem.
+//
+//    symbool   houden        kappen        staart die je verliest
+//    US100     n=99  +0,364   n=46  -0,674   5 trades met piek >=8R
+//    XAUUSD    n=106 +0,330   n=83  -0,675   2 trades met piek >=8R
+//
+//    Werkt op BEIDE symbolen vrijwel identiek. De gekapte kant is met
+//    -0,67 per trade duidelijk verliesgevend, dus kappen is juist.
+//    Kosten: 7 trades met een piek boven 8R gaan eruit.
+//
+//  REGEL B — milder: sluit alleen als hij na 45 min niet eens +0,1R haalde.
+//
+//    symbool   houden        kappen        staart die je verliest
+//    US100     n=124 +0,161   n=21  -0,714   2 trades
+//    XAUUSD    n=147 +0,041   n=42  -0,643   1 trade
+//
+//    Kapt veel minder trades (63 i.p.v. 129) en spaart 4 van de 7
+//    staart-winnaars. Maar de behouden kant is zwakker.
+//
+//  AANBEVELING: begin met REGEL A. De gekapte trades zijn bij beide
+//  symbolen even slecht (-0,67), en 45 min zonder +0,3R is een duidelijk
+//  signaal. Je verliest gemiddeld 7 staart-trades per 550 — dat is de prijs.
+//  Vind je dat te veel, stap dan over op REGEL B.
+//
+//  BELANGRIJK: de meting hierboven is op trades DIE DE KANAALFILTER
+//  PASSEERDEN. Op ongefilterde trades gelden andere getallen.
+const HANDMATIG = {
+  regelA: { naMinuten: 45, minR: 0.3 },
+  regelB: { naMinuten: 45, minR: 0.1 },
+  actief: "A",
+};
 
 module.exports = {
   TIMEZONE, DEFAULT_RISK_PCT, SL_BUFFER_MULT, RR_MIN, RR_MAX,
@@ -488,6 +604,8 @@ module.exports = {
   getVwapPosition, buildOptimizerKey, buildDailyLabel,
   canOpenNewTrade, TIME_BLOCK_WINDOWS, isTimeBlocked,
   DEFAULT_TP_RR, TP_RR_WINDOWS, getTpRR,
+  MIN_CHAN_R, berekenChanR, chanROk,
+  MAX_TOTAL_RISK_EUR, RISK_EUR_BASE, RISK_STAFFEL, getRiskEur, HANDMATIG,
   RISK_WINDOWS, GLOBAL_RISK_MULT, getRiskMult, roundLots,
   COOLDOWN_MIN, COOLDOWN_PER_SYMBOL, MAX_CONCURRENT,
   checkCooldown, markTradePlaced, resetCooldown,
