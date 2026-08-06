@@ -1,6 +1,6 @@
 "use strict";
 // ================================================================
-// session.js  v3.5.0  |  PRONTO-AI — UNIFIED TEMPLATE
+// session.js  v3.6.0  |  PRONTO-AI — UNIFIED TEMPLATE
 //
 // v3.5.0 (6 aug 2026) — HERZIEN op 874 ECHTE broker-trades uit de
 // journal-export (16 juni – 6 augustus, US100 + XAUUSD, inclusief swap
@@ -59,13 +59,30 @@ const TIMEZONE = "Europe/Brussels";
 
 // Risk per trade as a fraction of equity. 0.000375 = 0.0375%.
 // Met RISK_EQUITY=50000 -> $18,75 per trade op 1.0x.
-const DEFAULT_RISK_PCT = 0.000375;
+//
+//   v3.6.0: 0.000375 -> 0.0008. Met RISK_EQUITY=50000 gaat $18,75 naar $40
+//   per trade (2,13x). Je vroeg hierom; hier staat wat het betekent zodat
+//   je het bewust doet.
+//
+//     per trade   gemeten maxDD (18,2R)   winst over 51 dagen (63,2R)
+//      $18,75          $341  = 3,4%              +$1.185
+//      $30,00          $546  = 5,5%              +$1.896
+//      $40,00          $728  = 7,3%              +$2.528   <- gekozen
+//
+//   Op een FTMO-eval van 10k met 10% totale limiet houd je 2,7% marge over
+//   op een drawdown die AL is voorgekomen. En: 12 gelijktijdige posities
+//   die samen uitstoppen is $480 = 4,8%, dus je raakt de 5%-daglimiet bij
+//   precies je MAX_CONCURRENT. Dat is geen toeval maar wel krap — zie de
+//   opmerking bij MAX_CONCURRENT.
+//
+//   Wil je terug: 0.0006 = $30/trade, 5,5% drawdown, ruimere marge.
+const DEFAULT_RISK_PCT = 0.0008;
 
 // Server SL = sl_pct (from webhook) × SL_BUFFER_MULT × broker execution price.
 const SL_BUFFER_MULT = 1.5;
 
 const RR_MIN = 1.5;
-const RR_MAX = 2.5;
+const RR_MAX = 3.0;   // v3.6.0: was 2.5 — US100 10-14u draagt 3.0R
 
 // ── COOLDOWN — de belangrijkste toevoeging van deze versie ────────────
 //
@@ -97,6 +114,9 @@ const COOLDOWN_PER_SYMBOL = true;
 //   12 is de grens die de negatieve staart afsnijdt zonder de goede zone
 //   te raken. server.js moet dit afdwingen; session.js levert alleen het
 //   getal en de check.
+//   LET OP bij $40/trade: 12 posities die samen uitstoppen kost $480 op een
+//   10k-eval = 4,8%, net onder de 5%-daglimiet. Ga je naar $50/trade, zet
+//   dit dan naar 9 (9 x $50 = $450) — anders kan één cluster je dag kosten.
 const MAX_CONCURRENT = 12;
 
 // ── RISK MULTIPLIER ───────────────────────────────────────────────────
@@ -182,8 +202,34 @@ const FIRM_LIMITS = {
 //   Vlak 1.5R. De zone-RR's uit v3.4.0 zijn verwijderd: geen enkele hield
 //   stand in de tweede helft van de data, en de journal spreekt de
 //   ghost-analyse tegen op precies de zone die het langst overeind bleef.
+//
+//   v3.6.0 — RR-ZONES TERUG, maar nu op de JUISTE bron.
+//
+//   Correctie op v3.5.0: de collector draait vlak 1.5R, dus de broker-
+//   journal kan NIETS zeggen over hogere RR — die trades bestaan er niet.
+//   Alleen de ghost meet hoe ver een trade doorliep na TP. Journal -0,020
+//   bij 1,5R en ghost +0,167 bij 2,5R op hetzelfde blok spreken elkaar dus
+//   niet tegen; ze zeggen samen: dit blok wil een hogere RR.
+//
+//   Opgenomen zijn alleen zones die in BEIDE helften van de ghost-data
+//   positief zijn (n>=40). Tijden in Brusselse tijd.
+//
+//     ZONE                  n    RR     WR     EV_totaal  EV_1e   EV_2e
+//     US100 10-14u         87   3.0   29,9%     +0,195   +0,159  +0,333
+//     XAUUSD 00-06u        47   2.0   38,3%     +0,149   +0,313  +0,065
+//
+//   US100 10-14u op 4.0R meet nog hoger (+0,379) maar dat is 27,6% winrate
+//   en n=87 — te dun om je grootste blok op te zetten. 3.0 is de veilige
+//   kant van diezelfde curve.
+//
+//   NIET opgenomen: US100 19-24u (2.5R is +0,050 in de 2e helft maar
+//   -0,475 in de 1e), US100 14-17u (wisselt van teken per RR), XAUUSD
+//   10-14u (2.0R +0,063 totaal maar -0,087 in de 1e helft).
 const DEFAULT_TP_RR = 1.5;
-const TP_RR_WINDOWS = {};
+const TP_RR_WINDOWS = {
+  "US100.cash": [{ start: 1000, end: 1400, rr: 3.0 }],
+  "XAUUSD":     [{ start: 0,    end: 600,  rr: 2.0 }],
+};
 
 // ── Time blocks ───────────────────────────────────────────────────────
 //   Alleen waar BEIDE bronnen negatief zijn. Tijden in Brusselse tijd.
@@ -191,8 +237,15 @@ const TP_RR_WINDOWS = {};
 //   journaltijden lopen dus één uur voor. Onderstaande grenzen zijn al
 //   teruggerekend naar Brussel.
 const TIME_BLOCK_WINDOWS = {
-  // XAUUSD 19-24u: EV -0,186 over 83 trades. VOOR +0,216 (n=21) maar
-  // NA -0,322 (n=62) — en de NA-steekproef is drie keer groter.
+  // XAUUSD 19-24u — negatief in ELKE bron en op ELK RR-niveau:
+  //   journal  -0,186 (n=83)
+  //   ghost    -0,423 @1.5R / -0,446 @2.0R / -0,508 @3.0R (n=65)
+  //   1e helft -0,167   2e helft -0,605
+  // Dit is het enige blok waar alles het over eens is.
+  //
+  // XAUUSD 14-17u staat op de wachtlijst: 1e helft +0,111, 2e helft -0,271
+  // bij 1,5R, en negatief op elke hogere RR. Nog niet geblokkeerd omdat de
+  // eerste helft positief was — herbekijken bij de volgende dataset.
   "XAUUSD": [{ start: 1900, end: 2400 }],
 };
 
@@ -226,7 +279,7 @@ const SYMBOL_CATALOG    = FIRM_CFG.symbols;
 const BROKER            = FIRM;
 const BROKER_SYMBOL_MAP = { [FIRM]: FIRM_CFG.symbols };
 
-console.log(`[session.js] v3.5.0 FIRM="${FIRM}" (${FIRM_CFG.label}) mode=${MODE} | ` +
+console.log(`[session.js] v3.6.0 FIRM="${FIRM}" (${FIRM_CFG.label}) mode=${MODE} | ` +
   `gold->"${SYMBOL_CATALOG["XAUUSD"].mt5}" nasdaq->"${SYMBOL_CATALOG["US100.cash"].mt5}" | ` +
   `cooldown=${COOLDOWN_MIN}min maxOpen=${MAX_CONCURRENT} riskMult=${GLOBAL_RISK_MULT}x`);
 
