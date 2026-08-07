@@ -1,8 +1,8 @@
 "use strict";
 // ================================================================
-// session.js  v4.3.0  |  PRONTO-AI — UNIFIED TEMPLATE
+// session.js  v5.0.0  |  PRONTO-AI — UNIFIED TEMPLATE
 //
-// v4.3.0 (7 aug 2026) — HERZIEN op 307 handmatig uitgelezen ghost-rijen
+// v5.0.0 (7 aug 2026) — HERZIEN op 307 handmatig uitgelezen ghost-rijen
 // (22 juli - 6 augustus) plus 550 rijen uit de database.
 //
 // UITGANGSPUNT DAT ALLES BEPAALT: SL en TP staan VAST na plaatsing.
@@ -245,7 +245,7 @@ const FIRM_LIMITS = {
 //   trade, +44R totaal, 26R maxDD, langste verliesreeks 15.
 //   3.0R geeft marginaal meer EV (+0,147) maar 35R drawdown en een reeks
 //   van 23 — dat is €1.400 en 23 verliezers op rij bij €40.
-const DEFAULT_TP_RR = 2.0;
+const DEFAULT_TP_RR = 2.5;
 const TP_RR_WINDOWS = {};
 
 // ── KANAALFILTER — de enige poort die stand hield ────────────────────
@@ -335,7 +335,7 @@ const SYMBOL_CATALOG    = FIRM_CFG.symbols;
 const BROKER            = FIRM;
 const BROKER_SYMBOL_MAP = { [FIRM]: FIRM_CFG.symbols };
 
-console.log(`[session.js] v4.3.0 FIRM="${FIRM}" (${FIRM_CFG.label}) mode=${MODE} | ` +
+console.log(`[session.js] v5.0.0 FIRM="${FIRM}" (${FIRM_CFG.label}) mode=${MODE} | ` +
   `gold->"${SYMBOL_CATALOG["XAUUSD"].mt5}" nasdaq->"${SYMBOL_CATALOG["US100.cash"].mt5}" | ` +
   `cooldown=${COOLDOWN_MIN}min maxOpen=${MAX_CONCURRENT} riskMult=${GLOBAL_RISK_MULT}x`);
 
@@ -530,6 +530,10 @@ function canOpenNewTrade(rawSymbol, date = null, openPositions = null, ctx = {})
     const ch = chanROk(chanR);
     if (!ch.allowed) return { allowed: false, reason: ch.reason, chanR };
 
+    // Tegenpositie te dichtbij? Dan zitten we in een range.
+    const tp = tegenpositieOk(sym, ctx.direction, ctx.prijs, ctx.slDist, ctx.openPosities);
+    if (!tp.allowed) return { allowed: false, reason: tp.reason, chanR };
+
     const cd = checkCooldown(sym, date);
     if (!cd.allowed) {
       return { allowed: false,
@@ -541,6 +545,79 @@ function canOpenNewTrade(rawSymbol, date = null, openPositions = null, ctx = {})
   return { allowed: true, reason: null, chanR,
            riskEur: RISK_EUR,
            rr: DEFAULT_TP_RR };
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  TEGENPOSITIE-FILTER — de sterkste vondst van dit project
+//
+//  REGEL: weiger een signaal als er al een positie in de TEGENGESTELDE
+//  richting op hetzelfde symbool open staat binnen MAX_TEGEN_GAP_R van de
+//  huidige prijs.
+//
+//  WAAROM. Een tegenpositie op minder dan 1R betekent dat de prijs terug
+//  door je entryzone is gekomen. Je zit in een range die niemand uitbreekt.
+//  Gemeten over 557 ghosts:
+//
+//    situatie                          n     WR      EV@2.0   gem. piek
+//    geen tegenpositie <1R binnen 2u  146   46,6%    +0,397     3,79
+//    1 tegenpositie                   184   25,5%    -0,234     2,12
+//    2+ tegenposities                 227   24,7%    -0,260     1,70
+//
+//  Per paar bekeken nog scherper: van 360 paren die binnen 2 uur op minder
+//  dan 0,5R van elkaar openden, wonnen er DRIE allebei. In 152 gevallen won
+//  geen van beide. EV per paar -0,242.
+//
+//  WAT HET DOET OP SLECHTE DAGEN. De acht slechtste dagen uit de dataset,
+//  R zonder filter -> R met filter:
+//    6 aug  44 trades  -20,0R -> 10 trades  -10,0R
+//    5 aug  25 trades  -16,0R -> 14 trades  -11,0R
+//    28 jul 39 trades  -15,0R ->  7 trades   -1,0R
+//    16 jul 42 trades  -15,0R ->  6 trades   +3,0R
+//    21 jul 40 trades  -13,0R ->  7 trades   -1,0R
+//    4 aug  17 trades  -11,0R -> 10 trades   -4,0R
+//    22 jul 45 trades   -9,0R -> 12 trades   +9,0R
+//    20 jul 21 trades   -6,0R ->  8 trades   +4,0R
+//  Totaal -105R wordt -11R. Let op het patroon: elke rampdag heeft 40+
+//  trades. Een choppy dag genereert veel signalen in beide richtingen, en
+//  dat is precies wat deze filter herkent.
+//
+//  WAAROM WEIGEREN EN NIET SLUITEN. Een exit-regel op één been sloopt de
+//  structuur — dat gebeurde op 7 aug: de BUY's werden gesloten, goud brak
+//  naar boven uit, en alleen de SELL's bleven over. Weigeren bij de entry
+//  kost geen spread en vraagt geen handmatig ingrijpen.
+//
+//  RR 2.5 hoort hierbij. Op de solo-trades (US100, n=61) is 2.5 het laagste
+//  niveau dat in BEIDE helften van de data positief blijft (+1,115 / +0,077).
+//  RR 5.0 meet hoger (+1,164 totaal) maar dat is 36% winrate — dagen achter
+//  elkaar zonder winst. Niet doen tot er meer data is.
+const MAX_TEGEN_GAP_R = 1.0;
+
+/**
+ * Staat er een tegengestelde positie te dicht bij?
+ * server.js geeft de open posities mee als:
+ *   [{ symbol, direction: 'buy'|'sell', entry }]
+ *
+ * @param {string} symbolKey  canonical key (XAUUSD / US100.cash)
+ * @param {string} richting   'buy' of 'sell' van het NIEUWE signaal
+ * @param {number} prijs      huidige prijs / geplande entry
+ * @param {number} slDist     stopafstand in prijs-eenheden
+ * @param {Array}  openPosities
+ */
+function tegenpositieOk(symbolKey, richting, prijs, slDist, openPosities = []) {
+  if (!Array.isArray(openPosities) || !openPosities.length) return { allowed: true, reason: null };
+  if (!(slDist > 0) || !(prijs > 0)) return { allowed: true, reason: null };   // onbekend = doorlaten
+
+  for (const p of openPosities) {
+    if (!p || p.symbol !== symbolKey) continue;
+    if (p.direction === richting) continue;                    // zelfde kant, prima
+    const gapR = Math.abs(prijs - parseFloat(p.entry)) / slDist;
+    if (gapR < MAX_TEGEN_GAP_R) {
+      return { allowed: false,
+        reason: `TEGENPOSITIE: ${p.direction} open op ${gapR.toFixed(2)}R ` +
+                `(< ${MAX_TEGEN_GAP_R}R) — prijs is terug door de entryzone` };
+    }
+  }
+  return { allowed: true, reason: null };
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -577,9 +654,12 @@ function canOpenNewTrade(rawSymbol, date = null, openPositions = null, ctx = {})
 //  BELANGRIJK: de meting hierboven is op trades DIE DE KANAALFILTER
 //  PASSEERDEN. Op ongefilterde trades gelden andere getallen.
 const HANDMATIG = {
-  regelA: { naMinuten: 45, minR: 0.3 },
-  regelB: { naMinuten: 45, minR: 0.1 },
-  actief: "A",
+  // VERVALLEN. De 45-minutenregel is vervangen door de tegenpositie-filter
+  // bij de entry. Op 7 aug bleek waarom: één been van een paar sluiten laat
+  // je eenzijdig achter in de markt. Sluit NOOIT één kant van een paar —
+  // ofwel beide, ofwel geen van beide.
+  regel45min: null,
+  advies: "laat lopen tot SL of TP; grijp niet in op één been",
 };
 
 module.exports = {
@@ -594,6 +674,7 @@ module.exports = {
   DEFAULT_TP_RR, TP_RR_WINDOWS, getTpRR,
   MIN_CHAN_R, berekenChanR, chanROk,
   RISK_EUR, NOODREM_POSITIES, getRiskEur, HANDMATIG,
+  MAX_TEGEN_GAP_R, tegenpositieOk,
   RISK_WINDOWS, GLOBAL_RISK_MULT, getRiskMult, roundLots,
   COOLDOWN_MIN, COOLDOWN_PER_SYMBOL, MAX_CONCURRENT,
   checkCooldown, markTradePlaced, resetCooldown,
