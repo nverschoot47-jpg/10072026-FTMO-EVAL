@@ -42,6 +42,7 @@ const {
   getVwapPosition, buildOptimizerKey,
   buildDailyLabel, canOpenNewTrade,
   getTpRR, roundLots, getRiskMult,
+  RISK_EUR, werkelijkRisicoEur,   // v6.2.0: log real $ risk at min-lot rounding
 } = require("./session");
 
 const VERSION = "3.1.0";
@@ -1213,6 +1214,15 @@ app.post("/webhook", async (req, res) => {
     : parseFloat((lotNom / 100).toFixed(2));
   const lots    = roundLots(lotRaw, symInfo);
 
+  // v6.2.0: log the REAL $ risk once min-lot rounding is applied — riskEur
+  // above is only the target, roundLots() always rounds UP to volMin, so the
+  // actual exposure can be a lot higher. Purely a log line, doesn't block
+  // anything. See session.js v6.2.0 note.
+  const echtRisico = werkelijkRisicoEur(symInfo, slDist, riskEur);
+  if (echtRisico > riskEur * 1.2) {
+    console.warn(`[Sizing] ${symbol}: bedoeld ${riskEur}, WERKELIJK ${echtRisico} door min lot ${lots} (target was ${RISK_EUR})`);
+  }
+
   const dateStr    = getBrusselsDateStr();
   const dailyCount = await db.getNextDailyCount(dateStr).catch(() => 1);
   const dailyLabel = buildDailyLabel(null, dailyCount);
@@ -1389,7 +1399,7 @@ function dashboardHTML() {
   <div class="kst" style="grid-template-columns:repeat(6,1fr)" id="gh-kpis"></div>
   <div style="padding:0 10px 8px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">
     <span class="cd" style="font-size:9px">FILTER</span>
-    <select id="f-sym" onchange="loadGh()" style="background:#0d1117;color:#e6edf3;border:1px solid rgba(139,148,158,.25);border-radius:4px;font-size:10px;padding:2px 5px"><option value="">All symbols</option><option>XAUUSD</option><option>US100.cash</option></select>
+    <select id="f-sym" onchange="loadGh()" style="background:#0d1117;color:#e6edf3;border:1px solid rgba(139,148,158,.25);border-radius:4px;font-size:10px;padding:2px 5px"><option value="">All symbols</option><option>XAUUSD</option><option>US100.cash</option><option>GER40.cash</option><option>UK100.cash</option><option>UKOIL.cash</option><option>XAGUSD</option></select>
     <select id="f-sess" onchange="loadGh()" style="background:#0d1117;color:#e6edf3;border:1px solid rgba(139,148,158,.25);border-radius:4px;font-size:10px;padding:2px 5px"><option value="">All sessions</option><option value="asia">Asia</option><option value="london">London</option><option value="ny">New York</option></select>
     <select id="f-dir" onchange="loadGh()" style="background:#0d1117;color:#e6edf3;border:1px solid rgba(139,148,158,.25);border-radius:4px;font-size:10px;padding:2px 5px"><option value="">Both</option><option value="buy">Buy</option><option value="sell">Sell</option></select>
     <select id="f-st" onchange="loadGh()" style="background:#0d1117;color:#e6edf3;border:1px solid rgba(139,148,158,.25);border-radius:4px;font-size:10px;padding:2px 5px"><option value="">All status</option><option value="live">Live</option><option value="ghost">Ghost</option><option value="fin">Finished</option></select>
