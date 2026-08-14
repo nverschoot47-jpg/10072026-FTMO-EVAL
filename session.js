@@ -1,8 +1,38 @@
 "use strict";
 // ================================================================
-// session.js  v6.1.0  |  PRONTO-AI — UNIFIED TEMPLATE
+// session.js  v6.2.0  |  PRONTO-AI — UNIFIED TEMPLATE
 //
-// v6.1.0 (7 aug 2026) — GEHERCONFIGUREERD VOOR EUR 200 STARTKAPITAAL.
+// v6.2.0 (14 aug 2026) — TERUG NAAR ONGEFILTERD 1,5R + 4 NIEUWE SYMBOLEN.
+//
+//   Op verzoek: MGC1!/MNQ1! weer zonder filter, vast op 1,5R — zoals de
+//   originele ongefilterde reeks waar alle analyse op gebaseerd was.
+//
+//   BELANGRIJKE ONTDEKKING TIJDENS DEZE WIJZIGING: de kanaalfilter
+//   (MIN_CHAN_R), de tegenpositie-context en de cooldown draaiden in de
+//   praktijk AL NIET. server.js roept canOpenNewTrade(rawSym) aan zonder
+//   ctx, date of openPositions — precies het gat dat het "PATCH VOOR
+//   server.js"-blok verderop in dit bestand al beschreef, maar dat nooit is
+//   doorgevoerd. markTradePlaced() wordt nergens aangeroepen, dus de
+//   cooldown-klok stond ook al stil. Het ENIGE dat echt actief blokkeerde
+//   was de TIME_BLOCK_WINDOWS-regel die goud 24/7 volledig dichtzette.
+//   Die is nu verwijderd. MIN_CHAN_R en COOLDOWN_MIN staan hieronder ook op
+//   0/uit, puur defensief — mocht iemand ooit de patch alsnog doorvoeren,
+//   dan springen ze niet stiekem weer aan.
+//
+//   RISICO: RISK_EUR omhoog naar 5 en 4 nieuwe symbolen toegevoegd
+//   (GER40.cash, UK100.cash, UKOIL.cash, XAGUSD) via TradingView-webhooks
+//   MCL1!/SIL1!/GER40/UK100. LET OP — "minimum lotsize" is NIET hetzelfde
+//   als "maximaal $5 risico": roundLots() rondt altijd OMHOOG naar volMin,
+//   dus het werkelijke risico bij min lot is wat de sl-afstand van dat
+//   symbool op dat moment toevallig oplevert — niet per se $5. Voor goud was
+//   dat bij min lot gedocumenteerd EUR 18,45 (zie hieronder), ruim boven de
+//   $5-doelstelling. Voor de 4 nieuwe symbolen is dat NIET geverifieerd —
+//   zie de nieuwe [Sizing]-waarschuwing in server.js die het werkelijke
+//   risico per trade logt (werkelijkRisicoEur() bestond al in dit bestand,
+//   maar werd nooit aangeroepen). Check die logs voor je live gaat.
+//
+// ── v6.1.0 (7 aug 2026) — GEHERCONFIGUREERD VOOR EUR 200 STARTKAPITAAL.
+//   (historisch — XAUUSD is in v6.2.0 weer opengezet, zie hierboven)
 //
 // De analyse uit v6.0.0 staat ongewijzigd overeind (zie het blok "ANALYSE"
 // verderop). Wat veranderd is, is de RISICOKANT — en die verandert door één
@@ -119,15 +149,16 @@ const TIMEZONE = "Europe/Brussels";
 
 // ── RISICO ────────────────────────────────────────────────────────────
 //
-//   EUR 3 per trade op EUR 200 startkapitaal.
-//     gerealiseerde maxDD 11,9R = EUR  36  (18% van het account)
-//     p99 Monte Carlo  ~30R      = EUR  90  (45%)
-//     ergste run       ~50R      = EUR 150  (75%)
-//
-//   Hoger dan EUR 3 en de p99 wordt onhoudbaar. Lager dan EUR 1,04 kan niet
-//   (min lot US100). Verhoog pas als het account boven EUR 400 staat, en dan
-//   naar EUR 5 — niet naar EUR 20.
-const RISK_EUR = 3;
+//   v6.2.0: EUR/USD 5 per trade, expliciet gevraagd. Dit is het bedoelde
+//   risico dat de lot-formule NAAR STREEFT (riskEur / slDist) — het is GEEN
+//   harde cap. roundLots() rondt altijd omhoog naar het min lot van het
+//   symbool, dus zodra de berekende lotgrootte onder dat minimum valt, is
+//   het WERKELIJKE risico hoger dan 5 en varieert het per symbool/prijs.
+//   Voor goud was dat bij min lot gedocumenteerd EUR 18,45 (zie v6.1.0-note
+//   hierboven) — dat blijft zo, RISK_EUR optrekken naar 5 verandert daar
+//   niets aan. Kijk naar de "[Sizing]"-logregel in server.js (roept nu
+//   werkelijkRisicoEur() aan) om per symbool het ECHTE risico te zien.
+const RISK_EUR = 5;
 
 // 23 gelijktijdig open is gemeten in de gefilterde set. Bij EUR 3 is dat
 // EUR 69 aan open blootstelling = 35% van het account. Boven 20 posities
@@ -150,10 +181,16 @@ const RR_MIN = 1.5;
 const RR_MAX = 3.0;
 
 // ── TAKE PROFIT ───────────────────────────────────────────────────────
-//   Beide op 1,5R. Zie de ANALYSE-noot over 1,7R.
+//   Allemaal op 1,5R — geen uitzonderingen. Zie de ANALYSE-noot over 1,7R
+//   voor waarom US100/XAUUSD hier bleven staan; de 4 nieuwe symbolen hebben
+//   geen eigen backtest, dus ze volgen gewoon dezelfde 1,5R default.
 const TP_RR_PER_SYMBOL = {
   "US100.cash": 1.5,
   "XAUUSD":     1.5,
+  "GER40.cash": 1.5,
+  "UK100.cash": 1.5,
+  "UKOIL.cash": 1.5,
+  "XAGUSD":     1.5,
 };
 
 // De demo (mode=collect) MOET op 1,5R blijven. Dat is de ongefilterde
@@ -163,17 +200,24 @@ const COLLECT_TP_RR  = 1.5;
 
 const TP_RR_WINDOWS = {};
 
-// ── KANAALFILTER ──────────────────────────────────────────────────────
-const MIN_CHAN_R = 0.87;
+// ── KANAALFILTER — UIT (v6.2.0) ─────────────────────────────────────────
+//   0 = uit (chanR >= 0 is altijd waar). Was 0,87. In de praktijk deed dit
+//   toch al niets — server.js roept canOpenNewTrade() zonder ctx aan, dus
+//   chanR kwam altijd als null binnen en chanROk(null) laat sowieso door.
+//   Op 0 gezet zodat dat ook zo blijft als de ctx-wiring later alsnog wordt
+//   doorgevoerd (zie het PATCH-blok verderop in dit bestand).
+const MIN_CHAN_R = 0;
 
 // ── TEGENPOSITIE-FILTER — UIT ─────────────────────────────────────────
 //   0 = uit. Zie de ANALYSE-noot.
 const MAX_TEGEN_GAP_R = 0;
 
-// ── COOLDOWN ──────────────────────────────────────────────────────────
-//   Kost ~4,5R van de 67,7 en snijdt de drawdown met ~60%. Op EUR 200 weegt
-//   die drawdownreductie zwaarder dan de gemiste R.
-const COOLDOWN_MIN        = 5;
+// ── COOLDOWN — UIT (v6.2.0) ──────────────────────────────────────────
+//   Was 5 min. Net als de kanaalfilter deed dit al niets: markTradePlaced()
+//   wordt nergens in server.js aangeroepen, dus _lastTradeAt bleef altijd
+//   leeg en checkCooldown() gaf altijd "allowed". Op 0 gezet voor
+//   consistentie — "no filter" betekent hier ook geen cooldown.
+const COOLDOWN_MIN        = 0;
 const COOLDOWN_PER_SYMBOL = true;
 
 // ── RISK MULTIPLIER ───────────────────────────────────────────────────
@@ -184,69 +228,101 @@ const GLOBAL_RISK_MULT = 1.0;
 const RISK_WINDOWS = {};
 
 // ── TIJDBLOKKEN ───────────────────────────────────────────────────────
-//   XAUUSD 00:00-24:00 — VOLLEDIG GEBLOKKEERD op dit accountformaat.
-//   Min lot = EUR 18,45 risico = 9,2% van EUR 200 per trade, en roundLots()
-//   rondt omhoog naar het minimum, dus kleiner instellen werkt niet.
-//
-//   Goud had daarnaast EV ~0 op elk getest TP-niveau (1,5 / 1,7 / 1,9 / 2,2 /
-//   2,5R), in beide helften. Er gaat dus weinig verloren.
-//
-//   HERSTEL BIJ EEN GROTER ACCOUNT: zet terug naar [{ start: 1400, end: 2400 }]
-//   zodra het account boven EUR 2.000 staat. Dan is EUR 18,45 nog ~1% per
-//   trade en is de oorspronkelijke 14-24u blokkade weer de juiste keuze
-//   (geblokkeerd h1 -0,117 / h2 -0,096 vs toegestaan h1 +0,085 / h2 +0,082).
-const TIME_BLOCK_WINDOWS = {
-  "XAUUSD": [{ start: 0, end: 2400 }],
-};
+//   v6.2.0: leeg — geen tijdblokken meer. XAUUSD's 24/7 blok (v6.1.0, om
+//   accountformaat-redenen) is verwijderd op verzoek: "1,5R no filter" voor
+//   MGC1!/MNQ1!. Zie de v6.2.0-note bovenaan dit bestand voor de gevolgen
+//   voor het werkelijke risico bij min lot.
+const TIME_BLOCK_WINDOWS = {};
 
+// v6.2.0: GER40 en UK100 verwijderd uit de blocklist (nu expliciet
+// toegestaan, zie SYMBOL_ALIASES). De rest blijft geblokkeerd — die zijn
+// niet gevraagd en dit bestand kent geen catalogusregels voor ze.
 const BLOCKED_SYMBOLS = new Set([
   "US30USD","US30","DOW","DJI","DJIA",
-  "DE30EUR","DE30","DAX","GER30","GER40",
-  "UK100GBP","UK100","FTSE","FTSE100",
+  "DE30EUR","DE30","DAX","GER30",
+  "UK100GBP","FTSE","FTSE100",
   "SP500","SPX","US500","SPX500",
   "JP225","JPN225","NIKKEI",
 ]);
 
+// TradingView-tickersymbool -> canonieke sleutel (moet overeenkomen met een
+// key in elke firm's `symbols`-catalogus hieronder).
 const SYMBOL_ALIASES = {
-  "MGC1!": "XAUUSD",
-  "MNQ1!": "US100.cash",
+  "MGC1!":  "XAUUSD",       // Micro Gold futures      -> XAUUSD
+  "MNQ1!":  "US100.cash",   // Micro Nasdaq futures     -> US100.cash
+  "GER40":  "GER40.cash",   // DAX/GER40 cash index     -> GER40.cash
+  "UK100":  "UK100.cash",   // FTSE 100 cash index      -> UK100.cash
+  "MCL1!":  "UKOIL.cash",   // Micro WTI Crude futures  -> UKOIL.cash (let op: WTI-ticker, Brent-broker-symbool — zo gevraagd)
+  "SIL1!":  "XAGUSD",       // Micro Silver futures     -> XAGUSD
 };
 
-// ── Per-firm MT5 reroute + broker lot rules ───────────────────────────
+// v6.2.0: 4 nieuwe symbolen toegevoegd aan elke firm hieronder, met de
+// mt5-namen zoals opgegeven (GER40.cash, UK100.cash, UKOIL.cash, XAGUSD) —
+// hetzelfde voor alle firms, want er zijn geen per-firm varianten opgegeven.
+// LET OP: US100.cash heet bij vantage/fundednext ANDERS op de broker
+// (NAS100 / NDX100) — check of dat voor deze 4 nieuwe symbolen ook zo is
+// voordat je live gaat op die firms; pas de "mt5"-velden aan indien nodig.
+//
+// type:"commodity" gebruikt dezelfde /100-lotformule als goud (zie
+// werkelijkRisicoEur). Die verhouding is aan GOUD gekalibreerd — voor
+// UKOIL.cash en XAGUSD is dat NIET geverifieerd tegen de echte contract-
+// specificaties van de broker. volMin/volStep/pip hieronder zijn placeholders
+// die het gold/index-patroon spiegelen — controleer ze in MT5 Market Watch
+// (rechtsklik symbool -> Specificatie) voor je hier live geld op zet.
 const FIRMS = {
   ftmo_demo: {
     label: "FTMO-DEMO", mode: "collect", lotDecimals: 2,
     symbols: {
-      "XAUUSD":     { mt5: "XAUUSD",     type: "commodity", pip: 0.01, volMin: 0.01, volStep: 0.01 },
-      "US100.cash": { mt5: "US100.cash", type: "index",     pip: 0.10, volMin: 0.01, volStep: 0.01 },
+      "XAUUSD":     { mt5: "XAUUSD",     type: "commodity", pip: 0.01,  volMin: 0.01, volStep: 0.01 },
+      "US100.cash": { mt5: "US100.cash", type: "index",     pip: 0.10,  volMin: 0.01, volStep: 0.01 },
+      "GER40.cash": { mt5: "GER40.cash", type: "index",     pip: 0.10,  volMin: 0.01, volStep: 0.01 },
+      "UK100.cash": { mt5: "UK100.cash", type: "index",     pip: 0.10,  volMin: 0.01, volStep: 0.01 },
+      "UKOIL.cash": { mt5: "UKOIL.cash", type: "commodity", pip: 0.01,  volMin: 0.01, volStep: 0.01 },
+      "XAGUSD":     { mt5: "XAGUSD",     type: "commodity", pip: 0.001, volMin: 0.01, volStep: 0.01 },
     },
   },
   ftmo_eval: {
     label: "FTMO-EVAL", mode: "live", lotDecimals: 2,
     symbols: {
-      "XAUUSD":     { mt5: "XAUUSD",     type: "commodity", pip: 0.01, volMin: 0.01, volStep: 0.01 },
-      "US100.cash": { mt5: "US100.cash", type: "index",     pip: 0.10, volMin: 0.01, volStep: 0.01 },
+      "XAUUSD":     { mt5: "XAUUSD",     type: "commodity", pip: 0.01,  volMin: 0.01, volStep: 0.01 },
+      "US100.cash": { mt5: "US100.cash", type: "index",     pip: 0.10,  volMin: 0.01, volStep: 0.01 },
+      "GER40.cash": { mt5: "GER40.cash", type: "index",     pip: 0.10,  volMin: 0.01, volStep: 0.01 },
+      "UK100.cash": { mt5: "UK100.cash", type: "index",     pip: 0.10,  volMin: 0.01, volStep: 0.01 },
+      "UKOIL.cash": { mt5: "UKOIL.cash", type: "commodity", pip: 0.01,  volMin: 0.01, volStep: 0.01 },
+      "XAGUSD":     { mt5: "XAGUSD",     type: "commodity", pip: 0.001, volMin: 0.01, volStep: 0.01 },
     },
   },
   maven: {
     label: "MAVEN", mode: "live", lotDecimals: 2,
     symbols: {
-      "XAUUSD":     { mt5: "XAUUSD",     type: "commodity", pip: 0.01, volMin: 0.01, volStep: 0.01 },
-      "US100.cash": { mt5: "US100.cash", type: "index",     pip: 0.10, volMin: 0.01, volStep: 0.01 },
+      "XAUUSD":     { mt5: "XAUUSD",     type: "commodity", pip: 0.01,  volMin: 0.01, volStep: 0.01 },
+      "US100.cash": { mt5: "US100.cash", type: "index",     pip: 0.10,  volMin: 0.01, volStep: 0.01 },
+      "GER40.cash": { mt5: "GER40.cash", type: "index",     pip: 0.10,  volMin: 0.01, volStep: 0.01 },
+      "UK100.cash": { mt5: "UK100.cash", type: "index",     pip: 0.10,  volMin: 0.01, volStep: 0.01 },
+      "UKOIL.cash": { mt5: "UKOIL.cash", type: "commodity", pip: 0.01,  volMin: 0.01, volStep: 0.01 },
+      "XAGUSD":     { mt5: "XAGUSD",     type: "commodity", pip: 0.001, volMin: 0.01, volStep: 0.01 },
     },
   },
   vantage: {
     label: "VANTAGE", mode: "live", lotDecimals: 2,
     symbols: {
-      "XAUUSD":     { mt5: "XAUUSD", type: "commodity", pip: 0.01, volMin: 0.01, volStep: 0.01 },
-      "US100.cash": { mt5: "NAS100", type: "index",     pip: 0.10, volMin: 0.10, volStep: 0.10, lotDecimals: 1 },
+      "XAUUSD":     { mt5: "XAUUSD", type: "commodity", pip: 0.01,  volMin: 0.01, volStep: 0.01 },
+      "US100.cash": { mt5: "NAS100", type: "index",     pip: 0.10,  volMin: 0.10, volStep: 0.10, lotDecimals: 1 },
+      "GER40.cash": { mt5: "GER40.cash", type: "index",     pip: 0.10,  volMin: 0.01, volStep: 0.01 },
+      "UK100.cash": { mt5: "UK100.cash", type: "index",     pip: 0.10,  volMin: 0.01, volStep: 0.01 },
+      "UKOIL.cash": { mt5: "UKOIL.cash", type: "commodity", pip: 0.01,  volMin: 0.01, volStep: 0.01 },
+      "XAGUSD":     { mt5: "XAGUSD",     type: "commodity", pip: 0.001, volMin: 0.01, volStep: 0.01 },
     },
   },
   fundednext: {
     label: "FUNDEDNEXT", mode: "live", lotDecimals: 2,
     symbols: {
-      "XAUUSD":     { mt5: "XAUUSD", type: "commodity", pip: 0.01, volMin: 0.01, volStep: 0.01 },
-      "US100.cash": { mt5: "NDX100", type: "index",     pip: 0.01, volMin: 0.01, volStep: 0.01 },
+      "XAUUSD":     { mt5: "XAUUSD", type: "commodity", pip: 0.01,  volMin: 0.01, volStep: 0.01 },
+      "US100.cash": { mt5: "NDX100", type: "index",     pip: 0.01,  volMin: 0.01, volStep: 0.01 },
+      "GER40.cash": { mt5: "GER40.cash", type: "index",     pip: 0.10,  volMin: 0.01, volStep: 0.01 },
+      "UK100.cash": { mt5: "UK100.cash", type: "index",     pip: 0.10,  volMin: 0.01, volStep: 0.01 },
+      "UKOIL.cash": { mt5: "UKOIL.cash", type: "commodity", pip: 0.01,  volMin: 0.01, volStep: 0.01 },
+      "XAGUSD":     { mt5: "XAGUSD",     type: "commodity", pip: 0.001, volMin: 0.01, volStep: 0.01 },
     },
   },
 };
@@ -285,11 +361,11 @@ if (MODE !== "collect" && !process.env.RISK_EQUITY) {
 
 const _xauGeblokt = (TIME_BLOCK_WINDOWS["XAUUSD"] || []).some(w => w.start === 0 && w.end === 2400);
 
-console.log(`[session.js] v6.1.0 FIRM="${FIRM}" (${FIRM_CFG.label}) mode=${MODE} | ` +
-  `risk=EUR${RISK_EUR}/trade maxOpen=${NOODREM_POSITIES} | ` +
-  `US100=${TP_RR_PER_SYMBOL["US100.cash"]}R ` +
+console.log(`[session.js] v6.2.0 FIRM="${FIRM}" (${FIRM_CFG.label}) mode=${MODE} | ` +
+  `risk=${RISK_EUR}/trade (bedoeld, niet gegarandeerd bij min lot) maxOpen=${NOODREM_POSITIES} | ` +
+  `symbols=${Object.keys(SYMBOL_CATALOG).join(",")} alle op ${DEFAULT_TP_RR}R | ` +
   (MODE === "collect" ? `(collect -> ${COLLECT_TP_RR}R, geen filters)` :
-    `XAU=${_xauGeblokt ? "GEBLOKKEERD" : TP_RR_PER_SYMBOL["XAUUSD"] + "R"}`) + ` | ` +
+    `XAU=${_xauGeblokt ? "GEBLOKKEERD" : "open"}`) + ` | ` +
   `chanR>=${MIN_CHAN_R} cooldown=${COOLDOWN_MIN}min tegenpositie=${MAX_TEGEN_GAP_R === 0 ? "UIT" : MAX_TEGEN_GAP_R + "R"}`);
 
 function roundLots(rawLots, symInfo) {
