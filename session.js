@@ -263,66 +263,76 @@ const SYMBOL_ALIASES = {
 // (NAS100 / NDX100) — check of dat voor deze 4 nieuwe symbolen ook zo is
 // voordat je live gaat op die firms; pas de "mt5"-velden aan indien nodig.
 //
-// type:"commodity" gebruikt dezelfde /100-lotformule als goud (zie
-// werkelijkRisicoEur). Die verhouding is aan GOUD gekalibreerd — voor
-// UKOIL.cash en XAGUSD is dat NIET geverifieerd tegen de echte contract-
-// specificaties van de broker. volMin/volStep/pip hieronder zijn placeholders
-// die het gold/index-patroon spiegelen — controleer ze in MT5 Market Watch
-// (rechtsklik symbool -> Specificatie) voor je hier live geld op zet.
+// v6.3.0: contractSize toegevoegd, GEVERIFIEERD tegen de FTMO MT5-specificatie
+// (screenshots, 14 aug 2026):
+//   UK100.cash  contract grootte 1     -> bevestigt de oude "index"-aanname
+//   GER40.cash  contract grootte 1     -> bevestigt de oude "index"-aanname
+//   UKOIL.cash  contract grootte 100   -> bevestigt de oude "commodity"/100-aanname
+//   XAGUSD      contract grootte 5000  -> WIJKT AF. De oude type:"commodity"-
+//               formule deelde altijd door 100 (goud-aanname) — voor zilver
+//               had dat de lotgrootte 50x te GROOT gemaakt, dus ~50x het
+//               bedoelde risico. Nu gefixt: de lotformule gebruikt voortaan
+//               expliciet contractSize i.p.v. de type-binaire /100-gok.
+//   XAUUSD/US100.cash zijn NIET opnieuw geverifieerd nu — contractSize 100/1
+//   staat hier nog op de oude, al maandenlang in productie geteste aanname.
+// stopLevelPoints/digits: FTMO toont "Stop niveaus: 0" voor alle 4 nieuwe
+// symbolen (geen minimale afstand tussen prijs en SL/TP) — dus dit doet nu
+// niets, maar staat klaar voor als dat ooit niet meer 0 is (zie
+// widenForStopLevel() in server.js).
 const FIRMS = {
   ftmo_demo: {
     label: "FTMO-DEMO", mode: "collect", lotDecimals: 2,
     symbols: {
-      "XAUUSD":     { mt5: "XAUUSD",     type: "commodity", pip: 0.01,  volMin: 0.01, volStep: 0.01 },
-      "US100.cash": { mt5: "US100.cash", type: "index",     pip: 0.10,  volMin: 0.01, volStep: 0.01 },
-      "GER40.cash": { mt5: "GER40.cash", type: "index",     pip: 0.10,  volMin: 0.01, volStep: 0.01 },
-      "UK100.cash": { mt5: "UK100.cash", type: "index",     pip: 0.10,  volMin: 0.01, volStep: 0.01 },
-      "UKOIL.cash": { mt5: "UKOIL.cash", type: "commodity", pip: 0.01,  volMin: 0.01, volStep: 0.01 },
-      "XAGUSD":     { mt5: "XAGUSD",     type: "commodity", pip: 0.001, volMin: 0.01, volStep: 0.01 },
+      "XAUUSD":     { mt5: "XAUUSD",     type: "commodity", contractSize: 100,  digits: 2, stopLevelPoints: 0, pip: 0.01,  volMin: 0.01, volStep: 0.01 },
+      "US100.cash": { mt5: "US100.cash", type: "index",     contractSize: 1,    digits: 2, stopLevelPoints: 0, pip: 0.10,  volMin: 0.01, volStep: 0.01 },
+      "GER40.cash": { mt5: "GER40.cash", type: "index",     contractSize: 1,    digits: 2, stopLevelPoints: 0, pip: 0.10,  volMin: 0.01, volStep: 0.01 },
+      "UK100.cash": { mt5: "UK100.cash", type: "index",     contractSize: 1,    digits: 2, stopLevelPoints: 0, pip: 0.10,  volMin: 0.01, volStep: 0.01 },
+      "UKOIL.cash": { mt5: "UKOIL.cash", type: "commodity", contractSize: 100,  digits: 3, stopLevelPoints: 0, pip: 0.01,  volMin: 0.01, volStep: 0.01 },
+      "XAGUSD":     { mt5: "XAGUSD",     type: "commodity", contractSize: 5000, digits: 3, stopLevelPoints: 0, pip: 0.001, volMin: 0.01, volStep: 0.01 },
     },
   },
   ftmo_eval: {
     label: "FTMO-EVAL", mode: "live", lotDecimals: 2,
     symbols: {
-      "XAUUSD":     { mt5: "XAUUSD",     type: "commodity", pip: 0.01,  volMin: 0.01, volStep: 0.01 },
-      "US100.cash": { mt5: "US100.cash", type: "index",     pip: 0.10,  volMin: 0.01, volStep: 0.01 },
-      "GER40.cash": { mt5: "GER40.cash", type: "index",     pip: 0.10,  volMin: 0.01, volStep: 0.01 },
-      "UK100.cash": { mt5: "UK100.cash", type: "index",     pip: 0.10,  volMin: 0.01, volStep: 0.01 },
-      "UKOIL.cash": { mt5: "UKOIL.cash", type: "commodity", pip: 0.01,  volMin: 0.01, volStep: 0.01 },
-      "XAGUSD":     { mt5: "XAGUSD",     type: "commodity", pip: 0.001, volMin: 0.01, volStep: 0.01 },
+      "XAUUSD":     { mt5: "XAUUSD",     type: "commodity", contractSize: 100,  digits: 2, stopLevelPoints: 0, pip: 0.01,  volMin: 0.01, volStep: 0.01 },
+      "US100.cash": { mt5: "US100.cash", type: "index",     contractSize: 1,    digits: 2, stopLevelPoints: 0, pip: 0.10,  volMin: 0.01, volStep: 0.01 },
+      "GER40.cash": { mt5: "GER40.cash", type: "index",     contractSize: 1,    digits: 2, stopLevelPoints: 0, pip: 0.10,  volMin: 0.01, volStep: 0.01 },
+      "UK100.cash": { mt5: "UK100.cash", type: "index",     contractSize: 1,    digits: 2, stopLevelPoints: 0, pip: 0.10,  volMin: 0.01, volStep: 0.01 },
+      "UKOIL.cash": { mt5: "UKOIL.cash", type: "commodity", contractSize: 100,  digits: 3, stopLevelPoints: 0, pip: 0.01,  volMin: 0.01, volStep: 0.01 },
+      "XAGUSD":     { mt5: "XAGUSD",     type: "commodity", contractSize: 5000, digits: 3, stopLevelPoints: 0, pip: 0.001, volMin: 0.01, volStep: 0.01 },
     },
   },
   maven: {
     label: "MAVEN", mode: "live", lotDecimals: 2,
     symbols: {
-      "XAUUSD":     { mt5: "XAUUSD",     type: "commodity", pip: 0.01,  volMin: 0.01, volStep: 0.01 },
-      "US100.cash": { mt5: "US100.cash", type: "index",     pip: 0.10,  volMin: 0.01, volStep: 0.01 },
-      "GER40.cash": { mt5: "GER40.cash", type: "index",     pip: 0.10,  volMin: 0.01, volStep: 0.01 },
-      "UK100.cash": { mt5: "UK100.cash", type: "index",     pip: 0.10,  volMin: 0.01, volStep: 0.01 },
-      "UKOIL.cash": { mt5: "UKOIL.cash", type: "commodity", pip: 0.01,  volMin: 0.01, volStep: 0.01 },
-      "XAGUSD":     { mt5: "XAGUSD",     type: "commodity", pip: 0.001, volMin: 0.01, volStep: 0.01 },
+      "XAUUSD":     { mt5: "XAUUSD",     type: "commodity", contractSize: 100,  digits: 2, stopLevelPoints: 0, pip: 0.01,  volMin: 0.01, volStep: 0.01 },
+      "US100.cash": { mt5: "US100.cash", type: "index",     contractSize: 1,    digits: 2, stopLevelPoints: 0, pip: 0.10,  volMin: 0.01, volStep: 0.01 },
+      "GER40.cash": { mt5: "GER40.cash", type: "index",     contractSize: 1,    digits: 2, stopLevelPoints: 0, pip: 0.10,  volMin: 0.01, volStep: 0.01 },
+      "UK100.cash": { mt5: "UK100.cash", type: "index",     contractSize: 1,    digits: 2, stopLevelPoints: 0, pip: 0.10,  volMin: 0.01, volStep: 0.01 },
+      "UKOIL.cash": { mt5: "UKOIL.cash", type: "commodity", contractSize: 100,  digits: 3, stopLevelPoints: 0, pip: 0.01,  volMin: 0.01, volStep: 0.01 },
+      "XAGUSD":     { mt5: "XAGUSD",     type: "commodity", contractSize: 5000, digits: 3, stopLevelPoints: 0, pip: 0.001, volMin: 0.01, volStep: 0.01 },
     },
   },
   vantage: {
     label: "VANTAGE", mode: "live", lotDecimals: 2,
     symbols: {
-      "XAUUSD":     { mt5: "XAUUSD", type: "commodity", pip: 0.01,  volMin: 0.01, volStep: 0.01 },
-      "US100.cash": { mt5: "NAS100", type: "index",     pip: 0.10,  volMin: 0.10, volStep: 0.10, lotDecimals: 1 },
-      "GER40.cash": { mt5: "GER40.cash", type: "index",     pip: 0.10,  volMin: 0.01, volStep: 0.01 },
-      "UK100.cash": { mt5: "UK100.cash", type: "index",     pip: 0.10,  volMin: 0.01, volStep: 0.01 },
-      "UKOIL.cash": { mt5: "UKOIL.cash", type: "commodity", pip: 0.01,  volMin: 0.01, volStep: 0.01 },
-      "XAGUSD":     { mt5: "XAGUSD",     type: "commodity", pip: 0.001, volMin: 0.01, volStep: 0.01 },
+      "XAUUSD":     { mt5: "XAUUSD", type: "commodity", contractSize: 100,  digits: 2, stopLevelPoints: 0, pip: 0.01,  volMin: 0.01, volStep: 0.01 },
+      "US100.cash": { mt5: "NAS100", type: "index",     contractSize: 1,    digits: 2, stopLevelPoints: 0, pip: 0.10,  volMin: 0.10, volStep: 0.10, lotDecimals: 1 },
+      "GER40.cash": { mt5: "GER40.cash", type: "index",     contractSize: 1,    digits: 2, stopLevelPoints: 0, pip: 0.10,  volMin: 0.01, volStep: 0.01 },
+      "UK100.cash": { mt5: "UK100.cash", type: "index",     contractSize: 1,    digits: 2, stopLevelPoints: 0, pip: 0.10,  volMin: 0.01, volStep: 0.01 },
+      "UKOIL.cash": { mt5: "UKOIL.cash", type: "commodity", contractSize: 100,  digits: 3, stopLevelPoints: 0, pip: 0.01,  volMin: 0.01, volStep: 0.01 },
+      "XAGUSD":     { mt5: "XAGUSD",     type: "commodity", contractSize: 5000, digits: 3, stopLevelPoints: 0, pip: 0.001, volMin: 0.01, volStep: 0.01 },
     },
   },
   fundednext: {
     label: "FUNDEDNEXT", mode: "live", lotDecimals: 2,
     symbols: {
-      "XAUUSD":     { mt5: "XAUUSD", type: "commodity", pip: 0.01,  volMin: 0.01, volStep: 0.01 },
-      "US100.cash": { mt5: "NDX100", type: "index",     pip: 0.01,  volMin: 0.01, volStep: 0.01 },
-      "GER40.cash": { mt5: "GER40.cash", type: "index",     pip: 0.10,  volMin: 0.01, volStep: 0.01 },
-      "UK100.cash": { mt5: "UK100.cash", type: "index",     pip: 0.10,  volMin: 0.01, volStep: 0.01 },
-      "UKOIL.cash": { mt5: "UKOIL.cash", type: "commodity", pip: 0.01,  volMin: 0.01, volStep: 0.01 },
-      "XAGUSD":     { mt5: "XAGUSD",     type: "commodity", pip: 0.001, volMin: 0.01, volStep: 0.01 },
+      "XAUUSD":     { mt5: "XAUUSD", type: "commodity", contractSize: 100,  digits: 2, stopLevelPoints: 0, pip: 0.01,  volMin: 0.01, volStep: 0.01 },
+      "US100.cash": { mt5: "NDX100", type: "index",     contractSize: 1,    digits: 2, stopLevelPoints: 0, pip: 0.01,  volMin: 0.01, volStep: 0.01 },
+      "GER40.cash": { mt5: "GER40.cash", type: "index",     contractSize: 1,    digits: 2, stopLevelPoints: 0, pip: 0.10,  volMin: 0.01, volStep: 0.01 },
+      "UK100.cash": { mt5: "UK100.cash", type: "index",     contractSize: 1,    digits: 2, stopLevelPoints: 0, pip: 0.10,  volMin: 0.01, volStep: 0.01 },
+      "UKOIL.cash": { mt5: "UKOIL.cash", type: "commodity", contractSize: 100,  digits: 3, stopLevelPoints: 0, pip: 0.01,  volMin: 0.01, volStep: 0.01 },
+      "XAGUSD":     { mt5: "XAGUSD",     type: "commodity", contractSize: 5000, digits: 3, stopLevelPoints: 0, pip: 0.001, volMin: 0.01, volStep: 0.01 },
     },
   },
 };
@@ -385,16 +395,43 @@ function roundLots(rawLots, symInfo) {
 /**
  * Hoeveel euro riskeer je ECHT als de broker naar zijn minimum lot afrondt?
  *
+ * v6.3.0: gebruikt nu contractSize i.p.v. de oude type==="index"-binaire gok
+ * (die /100 deed voor ALLES wat geen index was — klopte toevallig voor goud
+ * en olie, maar was 50x fout voor zilver, contractSize 5000 i.p.v. 100).
+ *
  * Handig om te loggen: op een klein account is het verschil tussen bedoeld en
  * werkelijk risico het belangrijkste getal dat er is.
  */
 function werkelijkRisicoEur(symInfo, slDist, bedoeldRiskEur) {
   if (!(slDist > 0) || !symInfo) return bedoeldRiskEur;
+  const cs     = symInfo.contractSize ?? (symInfo.type === "index" ? 1 : 100);
   const lotNom = bedoeldRiskEur / slDist;
-  const lotRaw = symInfo.type === "index" ? lotNom : lotNom / 100;
+  const lotRaw = lotNom / cs;
   const lots   = roundLots(lotRaw, symInfo);
-  const eur    = symInfo.type === "index" ? lots * slDist : lots * 100 * slDist;
+  const eur    = lots * cs * slDist;
   return parseFloat(eur.toFixed(2));
+}
+
+/**
+ * v6.3.0 — "zet minimum lotsize aan, tenzij de SL breder moet van de broker".
+ *
+ * Als de broker een minimale afstand tussen prijs en SL/TP eist
+ * (symInfo.stopLevelPoints, in MT5-punten = 10^-digits), en de berekende
+ * slDist is smaller dan dat, dan wordt de SL/TP anders geweigerd door MT5.
+ * Deze functie verbreedt slDist tot het minimum dat de broker toestaat.
+ * Omdat de lotgrootte hierna vast op volMin blijft staan, betekent een
+ * bredere SL automatisch een hoger $ risico voor die ene trade — dat is
+ * precies "verhoog de risk tot de SL gezet kan worden".
+ * Voor de 4 nieuwe FTMO-symbolen staat stopLevelPoints op 0 (geverifieerd
+ * via Market Watch -> Specificatie), dus dit doet nu niets; het is een
+ * vangnet voor andere brokers/firms waar dat niet zo is.
+ */
+function widenForStopLevel(slDist, symInfo) {
+  const points = symInfo?.stopLevelPoints ?? 0;
+  if (!(points > 0)) return slDist;
+  const digits  = Number.isInteger(symInfo.digits) ? symInfo.digits : 2;
+  const minDist = points * Math.pow(10, -digits);
+  return Math.max(slDist, minDist);
 }
 
 function getBrusselsComponents(date = null) {
@@ -716,7 +753,7 @@ module.exports = {
   DEFAULT_TP_RR, COLLECT_TP_RR, TP_RR_PER_SYMBOL, TP_RR_WINDOWS, getTpRR,
   MIN_CHAN_R, berekenChanR, chanROk,
   RISK_EUR, RISK_EQUITY_REF, NOODREM_POSITIES, MAX_CONCURRENT,
-  getRiskEur, werkelijkRisicoEur, HANDMATIG,
+  getRiskEur, werkelijkRisicoEur, widenForStopLevel, HANDMATIG,
   MAX_TEGEN_GAP_R, tegenpositieOk,
   RISK_WINDOWS, GLOBAL_RISK_MULT, getRiskMult, roundLots,
   COOLDOWN_MIN, COOLDOWN_PER_SYMBOL,
