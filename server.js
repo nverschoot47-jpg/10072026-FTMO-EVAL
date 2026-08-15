@@ -42,7 +42,8 @@ const {
   getVwapPosition, buildOptimizerKey,
   buildDailyLabel, canOpenNewTrade,
   getTpRR, roundLots, getRiskMult,
-  RISK_EUR, werkelijkRisicoEur,   // v6.2.0: log real $ risk at min-lot rounding
+  RISK_EUR, werkelijkRisicoEur,          // v6.2.0: log real $ risk at min-lot rounding
+  widenForStopLevel,                     // v6.3.0: widen SL if broker's min stop-level requires it
 } = require("./session");
 
 const VERSION = "3.1.0";
@@ -1193,7 +1194,13 @@ app.post("/webhook", async (req, res) => {
   const slippage = tvEntry && execPrice ? Math.abs(execPrice - tvEntry) : 0;
 
   // ── SL & TP calculation ───────────────────────────────────────
-  const slDist  = parseFloat((slPct * SL_BUFFER_MULT * execPrice).toFixed(6));
+  let slDist = parseFloat((slPct * SL_BUFFER_MULT * execPrice).toFixed(6));
+  // v6.3.0: als de broker een minimale stop-afstand eist (stopLevelPoints),
+  // verbreed slDist tot dat minimum zodat MT5 de order niet weigert. Bij een
+  // vaste min-lot-sizing (zie hieronder) betekent dit automatisch een hoger
+  // $ risico voor die ene trade — precies zoals gevraagd: "tenzij SL hoger
+  // is dan verhoog je de risk tot de SL gezet kan worden".
+  slDist = parseFloat(widenForStopLevel(slDist, symInfo).toFixed(6));
   const slPrice = direction === "buy"
     ? parseFloat((execPrice - slDist).toFixed(6))
     : parseFloat((execPrice + slDist).toFixed(6));
@@ -1202,25 +1209,26 @@ app.post("/webhook", async (req, res) => {
     ? parseFloat((execPrice + slDist * tpRR).toFixed(6))
     : parseFloat((execPrice - slDist * tpRR).toFixed(6));
 
-  // ── Lot calculation with broker volume constraints ────────────
-  // Sizing base: RISK_EQUITY env override (lets a small demo size like a 50k account)
-  // or live equity. Risk can be boosted per firm+ticker+hour via getRiskMult (default 1.0).
+  // ── Lot calculation — v6.3.0: ALTIJD minimum lotsize ───────────
+  // Op verzoek: geen risk-based lotberekening meer. roundLots() rondde toch
+  // al bijna altijd omhoog naar volMin op dit accountformaat (zie de
+  // v6.1.0/v6.2.0-noten in session.js), dus deze stap maakt dat expliciet
+  // i.p.v. impliciet — en voorkomt bugs zoals de XAGUSD-contractSize-fout die
+  // hierboven gevonden werd, want lotRaw wordt nu nergens meer gebruikt om de
+  // order te sizen.
+  const lots = roundLots(symInfo.volMin ?? 0.01, symInfo);
+
+  // riskEur hieronder is nu puur informatief (voor de [Sizing]-log) — het
+  // stuurt de lotgrootte niet meer aan.
   const SIZING_EQUITY = safeNum(process.env.RISK_EQUITY) ?? latestEquity;
   const riskMult = getRiskMult(symbol, new Date());
   const riskEur = parseFloat((SIZING_EQUITY * DEFAULT_RISK_PCT * riskMult).toFixed(2));
-  const lotNom  = slDist > 0 ? riskEur / slDist : 0.01;
-  const lotRaw  = symInfo.type === "index"
-    ? parseFloat(lotNom.toFixed(2))
-    : parseFloat((lotNom / 100).toFixed(2));
-  const lots    = roundLots(lotRaw, symInfo);
 
-  // v6.2.0: log the REAL $ risk once min-lot rounding is applied — riskEur
-  // above is only the target, roundLots() always rounds UP to volMin, so the
-  // actual exposure can be a lot higher. Purely a log line, doesn't block
-  // anything. See session.js v6.2.0 note.
+  // Werkelijk $ risico bij min lot + (evt. verbrede) slDist — dit IS het
+  // echte risico van deze trade, ongeacht wat riskEur/RISK_EUR als doel had.
   const echtRisico = werkelijkRisicoEur(symInfo, slDist, riskEur);
-  if (echtRisico > riskEur * 1.2) {
-    console.warn(`[Sizing] ${symbol}: bedoeld ${riskEur}, WERKELIJK ${echtRisico} door min lot ${lots} (target was ${RISK_EUR})`);
+  if (echtRisico > RISK_EUR * 1.2) {
+    console.warn(`[Sizing] ${symbol}: min lot ${lots} = WERKELIJK ${echtRisico} risico (doel was ${RISK_EUR})`);
   }
 
   const dateStr    = getBrusselsDateStr();
@@ -1578,40 +1586,4 @@ async function initBackground() {
   if (META_API_TOKEN && META_ACCOUNT) {
     try {
       const acct = await Promise.race([
-        metaFetch(`/users/current/accounts/${META_ACCOUNT}/account-information`),
-        new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 20000)),
-      ]);
-      if (acct?.balance !== undefined) {
-        latestEquity   = parseFloat(acct.equity ?? acct.balance);
-        latestCurrency = acct.currency ?? "USD";
-        _acctCache = acct; _acctCacheTs = Date.now();
-        console.log(`[MetaAPI] Connected — ${acct.balance} ${acct.currency}`);
-        const live = await getPositions();
-        for (const lp of live) { if (!openPositions.has(String(lp.id))) await adoptPosition(lp); }
-      }
-    } catch (e) { console.error(`[MetaAPI] Startup failed: ${e.message}`); _metaFails = 0; _circuitOpen = false; }
-  } else {
-    console.warn("[MetaAPI] META_API_TOKEN or META_ACCOUNT not set — no MetaAPI connection");
-  }
-
-  // 5A: surface signals that were received but never reached a terminal outcome
-  // (process died mid-flight). Live positions have already been re-adopted above,
-  // so anything still unprocessed is flagged for review — NOT auto re-executed
-  // (that needs idempotency, feature #6, to be safe against double orders).
-  try {
-    const pending = await db.loadUnprocessedInbox(50);
-    if (pending.length) {
-      console.warn(`[Inbox] ${pending.length} unprocessed signal(s) from a prior crash — review /api/inbox-unprocessed`);
-      for (const p of pending) console.warn(`[Inbox]   #${p.id} ${p.symbol ?? "?"} ${p.action ?? "?"} @ ${p.receivedAt}`);
-    } else {
-      console.log("[Inbox] no unprocessed signals");
-    }
-  } catch (e) { console.error("[Inbox] boot check failed:", e.message); }
-
-  cron.schedule("*/10 * * * * *", syncPositions);
-  cron.schedule("*/5 * * * *", () => { cleanupFinalizedGhosts().catch(e => console.warn("[Reaper]", e.message)); });   // runs even when circuit is OPEN
-  cron.schedule("0 6 * * *", () => { db.computeDataHealth().catch(e => console.warn("[DataHealth] cron:", e.message)); }); // 11: daily 06:00 UTC integrity scan
-  console.log(`[PRONTO-AI] Cron active — 10s sync | ghost reaper 5min (stale>${GHOST_STALE_MIN}m, maxage>${GHOST_MAX_HOURS}h) | data-health 06:00 UTC`);
-}
-
-initBackground().catch(e => { console.error("[FATAL] initBackground:", e.message); });
+        metaFetch(`/users/current/accounts/${META_ACCOUNT}/account-info
