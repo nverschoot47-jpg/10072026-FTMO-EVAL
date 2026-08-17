@@ -149,16 +149,40 @@ const TIMEZONE = "Europe/Brussels";
 
 // ── RISICO ────────────────────────────────────────────────────────────
 //
-//   v6.2.0: EUR/USD 5 per trade, expliciet gevraagd. Dit is het bedoelde
+//   EUR 20 per trade, expliciet gevraagd (was 5). Dit is het bedoelde
 //   risico dat de lot-formule NAAR STREEFT (riskEur / slDist) — het is GEEN
 //   harde cap. roundLots() rondt altijd omhoog naar het min lot van het
 //   symbool, dus zodra de berekende lotgrootte onder dat minimum valt, is
-//   het WERKELIJKE risico hoger dan 5 en varieert het per symbool/prijs.
-//   Voor goud was dat bij min lot gedocumenteerd EUR 18,45 (zie v6.1.0-note
-//   hierboven) — dat blijft zo, RISK_EUR optrekken naar 5 verandert daar
-//   niets aan. Kijk naar de "[Sizing]"-logregel in server.js (roept nu
+//   het WERKELIJKE risico hoger dan 20 en varieert het per symbool/prijs.
+//
+//   LET OP — roundLots() rondt NAAR BENEDEN af, niet omhoog:
+//     stepsCount = Math.floor(rawLots / step)  ->  Math.max(volMin, stepped)
+//   De oudere notities bovenaan dit bestand ("rondt altijd OMHOOG naar
+//   volMin") kloppen alleen voor het geval dat de berekende lot ONDER volMin
+//   valt. In alle andere gevallen ligt het werkelijke risico juist LAGER dan
+//   het streefbedrag, doordat er naar de lotstap omlaag wordt afgekapt.
+//
+//   Gemeten met werkelijkRisicoEur() bij RISK_EUR = 20 (indicatieprijzen,
+//   slDist = 0,003 x 1,5 x prijs):
+//     XAUUSD      ~4100   slDist  18,45  -> lot 0,01  -> EUR 18,45
+//     US100.cash ~23000   slDist 103,50  -> lot 0,19  -> EUR 19,67
+//     GER40.cash ~24000   slDist 108,00  -> lot 0,18  -> EUR 19,44
+//     UK100.cash  ~9500   slDist  42,75  -> lot 0,46  -> EUR 19,67
+//     UKOIL.cash    ~65   slDist   0,29  -> lot 0,68  -> EUR 19,89
+//     XAGUSD        ~50   slDist   0,23  -> lot 0,01  -> EUR 11,25
+//   Geen enkel symbool schiet bij deze prijzen boven de 20 uit; goud zit nog
+//   op de min-lot-vloer (18,45) en zilver ligt laag door contractSize 5000.
+//
+//   WAT ER VERANDERT DOOR 5 -> 20:
+//     - Posities worden tot ~4x zo groot; alleen goud verandert niet, dat
+//       zat al op de min-lot-vloer van EUR 18,45.
+//     - MAX_CONCURRENT staat nog op 20 -> tot EUR 400 open blootstelling.
+//       De comment daaronder rekent nog met EUR 3 per trade; die klopt niet
+//       meer.
+//
+//   Kijk naar de "[Sizing]"-logregel in server.js (roept
 //   werkelijkRisicoEur() aan) om per symbool het ECHTE risico te zien.
-const RISK_EUR = 5;
+const RISK_EUR = 20;
 
 // 23 gelijktijdig open is gemeten in de gefilterde set. Bij EUR 3 is dat
 // EUR 69 aan open blootstelling = 35% van het account. Boven 20 posities
@@ -169,7 +193,7 @@ const MAX_CONCURRENT   = NOODREM_POSITIES;
 // server.js sizet via SIZING_EQUITY x DEFAULT_RISK_PCT.
 // ZET RISK_EQUITY=50000 IN DE ENV — anders sizet hij op je echte EUR 200.
 const RISK_EQUITY_REF  = 50000;
-const DEFAULT_RISK_PCT = RISK_EUR / RISK_EQUITY_REF;   // 0.00006
+const DEFAULT_RISK_PCT = RISK_EUR / RISK_EQUITY_REF;   // 20/50000 = 0.0004
 
 /** Risico in euro. Vast bedrag — geen staffel, geen plafond. */
 function getRiskEur() { return RISK_EUR; }
