@@ -1209,22 +1209,26 @@ app.post("/webhook", async (req, res) => {
     ? parseFloat((execPrice + slDist * tpRR).toFixed(6))
     : parseFloat((execPrice - slDist * tpRR).toFixed(6));
 
-  // ── Lot calculation — v6.3.0: ALTIJD minimum lotsize ───────────
-  // Op verzoek: geen risk-based lotberekening meer. roundLots() rondde toch
-  // al bijna altijd omhoog naar volMin op dit accountformaat (zie de
-  // v6.1.0/v6.2.0-noten in session.js), dus deze stap maakt dat expliciet
-  // i.p.v. impliciet — en voorkomt bugs zoals de XAGUSD-contractSize-fout die
-  // hierboven gevonden werd, want lotRaw wordt nu nergens meer gebruikt om de
-  // order te sizen.
-  const lots = roundLots(symInfo.volMin ?? 0.01, symInfo);
-
-  // riskEur hieronder is nu puur informatief (voor de [Sizing]-log) — het
-  // stuurt de lotgrootte niet meer aan.
+  // ── Lot calculation — RISK-BASED, doel EUR 20 per trade ────────
+  // Teruggezet van "ALTIJD minimum lotsize" naar risk-based sizing, zodat
+  // RISK_EUR (session.js) de positiegrootte weer echt aanstuurt.
+  //
+  // contractSize wordt EXPLICIET gebruikt — niet de oude type-binaire
+  // /100-gok, die 50x fout was voor XAGUSD (contractSize 5000).
+  //
+  // roundLots() kapt naar beneden af naar volStep en heeft volMin als vloer.
+  // Waar het doelrisico een lot onder volMin oplevert, wint de vloer en ligt
+  // het werkelijke risico HOGER dan 20 — dat is precies "tenzij de stoploss
+  // dat niet toelaat, dan gaan we hoger in risk". De [Sizing]-log hieronder
+  // meldt elk zo'n geval.
   const SIZING_EQUITY = safeNum(process.env.RISK_EQUITY) ?? latestEquity;
   const riskMult = getRiskMult(symbol, new Date());
   const riskEur = parseFloat((SIZING_EQUITY * DEFAULT_RISK_PCT * riskMult).toFixed(2));
 
-  // Werkelijk $ risico bij min lot + (evt. verbrede) slDist — dit IS het
+  const _contractSize = symInfo.contractSize ?? (symInfo.type === "index" ? 1 : 100);
+  const lots = roundLots((riskEur / slDist) / _contractSize, symInfo);
+
+  // Werkelijk $ risico bij deze lot + (evt. verbrede) slDist — dit IS het
   // echte risico van deze trade, ongeacht wat riskEur/RISK_EUR als doel had.
   const echtRisico = werkelijkRisicoEur(symInfo, slDist, riskEur);
   if (echtRisico > RISK_EUR * 1.2) {
@@ -1583,7 +1587,55 @@ async function initBackground() {
   dbReady = true;
   console.log("[PRONTO-AI] DB ready");
 
+  // ── MetaAPI startup ─────────────────────────────────────────────
+  // HERSTELD uit de v2.0.0-backup (server 10). Het v3.1.0-bestand was hier
+  // afgekapt: het eindigde midden in de account-information-call, en alles
+  // daarna — de positie-adoptie, de cron-jobs en de initBackground()-aanroep —
+  // ontbrak volledig. Zonder dit blok initialiseert de server de database en
+  // doet daarna niets meer: geen sync, geen ghost-updates.
   if (META_API_TOKEN && META_ACCOUNT) {
     try {
+      // Note: /deploy removed - not needed if account already deployed, causes rate limits
       const acct = await Promise.race([
-        metaFetch(`/users/current/accounts/${META_ACCOUNT}/account-info
+        metaFetch(`/users/current/accounts/${META_ACCOUNT}/account-information`),
+        new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 20000)),
+      ]);
+      if (acct?.balance !== undefined) {
+        latestEquity   = parseFloat(acct.equity ?? acct.balance);
+        latestCurrency = acct.currency ?? "USD";
+        _acctCache = acct; _acctCacheTs = Date.now();
+        console.log(`[MetaAPI] Connected — ${acct.balance} ${acct.currency}`);
+        // Adopt live MT5 positions not in memory
+        const live = await getPositions();
+        for (const lp of live) {
+          if (!openPositions.has(String(lp.id))) await adoptPosition(lp);
+        }
+      }
+    } catch (e) {
+      console.error(`[MetaAPI] Startup failed: ${e.message}`);
+      // Reset fail counter - startup failure is expected during MetaAPI outages
+      _metaFails = 0; _circuitOpen = false;
+    }
+  } else {
+    console.warn("[MetaAPI] META_API_TOKEN or META_ACCOUNT not set — no MetaAPI connection");
+  }
+
+  cron.schedule("*/10 * * * * *", syncPositions);        // 10s to reduce MetaAPI load
+  cron.schedule("*/5 * * * *",    cleanupFinalizedGhosts);
+
+  // NIET uit de backup — de v2.0.0-versie kende /api/data-health nog niet.
+  // Het dashboard van v3.1.0 zegt "daily 06:00 UTC integrity scan", dus die
+  // cron hoorde in het afgekapte staartje te staan. Dit is een RECONSTRUCTIE:
+  // controleer of dit overeenkomt met wat er stond. Weghalen kan veilig — dan
+  // vult /api/data-health zich alleen nog via de handmatige POST-route.
+  cron.schedule("0 6 * * *", async () => {
+    try { await db.computeDataHealth(); }
+    catch (e) { console.warn("[DataHealth] scan failed:", e.message); }
+  });
+
+  console.log("[PRONTO-AI] Cron active — 10s sync");
+}
+
+initBackground().catch(e => {
+  console.error("[FATAL] initBackground:", e.message);
+});
