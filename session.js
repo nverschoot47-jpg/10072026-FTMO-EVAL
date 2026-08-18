@@ -149,11 +149,13 @@ const TIMEZONE = "Europe/Brussels";
 
 // ── RISICO ────────────────────────────────────────────────────────────
 //
-//   EUR 20 per trade, expliciet gevraagd (was 5). Dit is het bedoelde
-//   risico dat de lot-formule NAAR STREEFT (riskEur / slDist) — het is GEEN
-//   harde cap. roundLots() rondt altijd omhoog naar het min lot van het
-//   symbool, dus zodra de berekende lotgrootte onder dat minimum valt, is
-//   het WERKELIJKE risico hoger dan 20 en varieert het per symbool/prijs.
+//   v6.4.0: RISK_EUR 20 -> 10, op verzoek.
+//
+//   EUR 10 per trade. Dit is het bedoelde risico dat de lot-formule NAAR
+//   STREEFT (riskEur / slDist) — het is GEEN harde cap. roundLots() rondt
+//   altijd omhoog naar het min lot van het symbool, dus zodra de berekende
+//   lotgrootte onder dat minimum valt, is het WERKELIJKE risico hoger dan
+//   10 en varieert het per symbool/prijs.
 //
 //   LET OP — roundLots() rondt NAAR BENEDEN af, niet omhoog:
 //     stepsCount = Math.floor(rawLots / step)  ->  Math.max(volMin, stepped)
@@ -162,38 +164,28 @@ const TIMEZONE = "Europe/Brussels";
 //   valt. In alle andere gevallen ligt het werkelijke risico juist LAGER dan
 //   het streefbedrag, doordat er naar de lotstap omlaag wordt afgekapt.
 //
-//   Gemeten met werkelijkRisicoEur() bij RISK_EUR = 20 (indicatieprijzen,
-//   slDist = 0,003 x 1,5 x prijs):
-//     XAUUSD      ~4100   slDist  18,45  -> lot 0,01  -> EUR 18,45
-//     US100.cash ~23000   slDist 103,50  -> lot 0,19  -> EUR 19,67
-//     GER40.cash ~24000   slDist 108,00  -> lot 0,18  -> EUR 19,44
-//     UK100.cash  ~9500   slDist  42,75  -> lot 0,46  -> EUR 19,67
-//     UKOIL.cash    ~65   slDist   0,29  -> lot 0,68  -> EUR 19,89
-//     XAGUSD        ~50   slDist   0,23  -> lot 0,01  -> EUR 11,25
-//   Geen enkel symbool schiet bij deze prijzen boven de 20 uit; goud zit nog
-//   op de min-lot-vloer (18,45) en zilver ligt laag door contractSize 5000.
-//
-//   WAT ER VERANDERT DOOR 5 -> 20:
-//     - Posities worden tot ~4x zo groot; alleen goud verandert niet, dat
-//       zat al op de min-lot-vloer van EUR 18,45.
-//     - MAX_CONCURRENT staat nog op 20 -> tot EUR 400 open blootstelling.
-//       De comment daaronder rekent nog met EUR 3 per trade; die klopt niet
-//       meer.
-//
 //   Kijk naar de "[Sizing]"-logregel in server.js (roept
 //   werkelijkRisicoEur() aan) om per symbool het ECHTE risico te zien.
-const RISK_EUR = 20;
+const RISK_EUR = 10;
 
-// 23 gelijktijdig open is gemeten in de gefilterde set. Bij EUR 3 is dat
-// EUR 69 aan open blootstelling = 35% van het account. Boven 20 posities
-// wordt dat onhoudbaar, dus dit is hier een echte limiet en geen noodrem.
+// ── PER-SIDE POSITIELIMIET ───────────────────────────────────────────
+//   v6.4.0: vervangt de oude globale NOODREM_POSITIES/MAX_CONCURRENT-cap.
+//   Max 5 open buys EN max 5 open sells per symbool. Zodra één zijde als
+//   EERST de 5 bereikt, wordt de TEGENGESTELDE zijde daarna gecapt op 4 —
+//   dus nooit 5-5, altijd 5-4 (welke kant "wint" de volle 5 hangt af van
+//   welke kant het eerst 5 open heeft staan). Zie sidePositionsOk()
+//   verderop, en de aanroep ervan in canOpenNewTrade().
+const MAX_PER_SIDE = 5;
+
+// Oude constanten, niet langer gebruikt in canOpenNewTrade() (zie
+// sidePositionsOk() hieronder), maar laten staan voor exports/compat.
 const NOODREM_POSITIES = 20;
 const MAX_CONCURRENT   = NOODREM_POSITIES;
 
-// server.js sizet via SIZING_EQUITY x DEFAULT_RISK_PCT.
+// server.js rekent via SIZING_EQUITY x DEFAULT_RISK_PCT.
 // ZET RISK_EQUITY=50000 IN DE ENV — anders sizet hij op je echte EUR 200.
 const RISK_EQUITY_REF  = 50000;
-const DEFAULT_RISK_PCT = RISK_EUR / RISK_EQUITY_REF;   // 20/50000 = 0.0004
+const DEFAULT_RISK_PCT = RISK_EUR / RISK_EQUITY_REF;   // 10/50000 = 0.0002
 
 /** Risico in euro. Vast bedrag — geen staffel, geen plafond. */
 function getRiskEur() { return RISK_EUR; }
@@ -396,7 +388,7 @@ if (MODE !== "collect" && !process.env.RISK_EQUITY) {
 const _xauGeblokt = (TIME_BLOCK_WINDOWS["XAUUSD"] || []).some(w => w.start === 0 && w.end === 2400);
 
 console.log(`[session.js] v6.2.0 FIRM="${FIRM}" (${FIRM_CFG.label}) mode=${MODE} | ` +
-  `risk=${RISK_EUR}/trade (bedoeld, niet gegarandeerd bij min lot) maxOpen=${NOODREM_POSITIES} | ` +
+  `risk=${RISK_EUR}/trade (bedoeld, niet gegarandeerd bij min lot) maxPerSide=${MAX_PER_SIDE} | ` +
   `symbols=${Object.keys(SYMBOL_CATALOG).join(",")} alle op ${DEFAULT_TP_RR}R | ` +
   (MODE === "collect" ? `(collect -> ${COLLECT_TP_RR}R, geen filters)` :
     `XAU=${_xauGeblokt ? "GEBLOKKEERD" : "open"}`) + ` | ` +
@@ -608,6 +600,35 @@ function tegenpositieOk(symbolKey, richting, prijs, slDist, openPosities = []) {
   return { allowed: true, reason: null };
 }
 
+/**
+ * v6.4.0 — per-symbool, per-richting positielimiet.
+ *
+ * Max MAX_PER_SIDE (5) open buys EN max MAX_PER_SIDE open sells per symbool.
+ * Maar niet symmetrisch tot het einde: zodra een zijde als EERSTE de 5
+ * bereikt, wordt de TEGENGESTELDE zijde daarna gecapt op MAX_PER_SIDE - 1
+ * (4). Het wordt dus nooit 5-5, altijd 5-4 (of 4-5) — welke kant de volle 5
+ * krijgt hangt af van welke kant het eerst zover was.
+ *
+ * @param {string} direction   "buy" | "sell" — de richting van de NIEUWE trade
+ * @param {number} buyCount    aantal nu ECHT open buys op dit symbool
+ * @param {number} sellCount   aantal nu ECHT open sells op dit symbool
+ */
+function sidePositionsOk(direction, buyCount, sellCount) {
+  const same  = direction === "buy" ? buyCount  : sellCount;
+  const other = direction === "buy" ? sellCount : buyCount;
+
+  if (same >= MAX_PER_SIDE) {
+    return { allowed: false,
+      reason: `MAX_SIDE: ${direction} al ${same}/${MAX_PER_SIDE} open op dit symbool` };
+  }
+  if (other >= MAX_PER_SIDE && same >= MAX_PER_SIDE - 1) {
+    return { allowed: false,
+      reason: `MAX_OPPOSITE_CAP: tegenzijde staat al op ${other}/${MAX_PER_SIDE} — ` +
+              `deze zijde (${direction}) blijft op max ${MAX_PER_SIDE - 1}` };
+  }
+  return { allowed: true, reason: null };
+}
+
 // ── COOLDOWN-STAAT ────────────────────────────────────────────────────
 const _lastTradeAt = new Map();
 
@@ -640,12 +661,17 @@ function resetCooldown(symbolKey = null) {
  *
  * @param {string} rawSymbol
  * @param {Date|string|null} date
- * @param {number|null} openPositions   aantal nu open posities
+ * @param {number|null} openPositions   (niet meer gebruikt voor een globale
+ *                                        cap sinds v6.4.0 — zie ctx.buyCount/
+ *                                        ctx.sellCount voor de per-side cap)
  * @param {object} ctx                  { sessionHigh, sessionLow, slDist,
- *                                        direction, prijs, openPosities }
+ *                                        direction, prijs, openPosities,
+ *                                        buyCount, sellCount }
  *
  * WAARSCHUWING: laat je ctx weg, dan is chanR null en wordt de kanaalfilter
- * OVERGESLAGEN. Zie de patch onderaan.
+ * OVERGESLAGEN. Zie de patch onderaan. buyCount/sellCount ontbreken dan ook
+ * (worden als 0 behandeld), dus laat ctx altijd meesturen als je de
+ * per-side limiet wilt laten gelden.
  */
 function canOpenNewTrade(rawSymbol, date = null, openPositions = null, ctx = {}) {
   if (isWeekend(date)) return { allowed: false, reason: "WEEKEND" };
@@ -669,11 +695,10 @@ function canOpenNewTrade(rawSymbol, date = null, openPositions = null, ctx = {})
           : `TIME_BLOCK: ${sym} ${_fmtHHMM(blk.start)}\u2013${_fmtHHMM(blk.end)} Brussels` };
     }
 
-    if (Number.isFinite(openPositions) && openPositions >= NOODREM_POSITIES) {
-      return { allowed: false, chanR,
-        reason: `MAX_OPEN: ${openPositions} posities open (>=${NOODREM_POSITIES}) — ` +
-                `EUR ${(openPositions * RISK_EUR).toFixed(0)} blootstelling` };
-    }
+    const buyCount  = Number.isFinite(ctx.buyCount)  ? ctx.buyCount  : 0;
+    const sellCount = Number.isFinite(ctx.sellCount) ? ctx.sellCount : 0;
+    const sideCheck = sidePositionsOk(ctx.direction, buyCount, sellCount);
+    if (!sideCheck.allowed) return { allowed: false, chanR, reason: sideCheck.reason };
 
     const ch = chanROk(chanR);
     if (!ch.allowed) return { allowed: false, reason: ch.reason, chanR };
@@ -732,7 +757,8 @@ function canOpenNewTrade(rawSymbol, date = null, openPositions = null, ctx = {})
 //           : blockReason.startsWith("CHAN_R")       ? "CHAN_R_TOO_NARROW"
 //           : blockReason.startsWith("COOLDOWN")     ? "COOLDOWN"
 //           : blockReason.startsWith("TEGENPOSITIE") ? "COUNTER_POSITION"
-//           : blockReason.startsWith("MAX_OPEN")     ? "MAX_OPEN"
+//           : blockReason.startsWith("MAX_SIDE")     ? "MAX_SIDE"
+//           : blockReason.startsWith("MAX_OPPOSITE") ? "MAX_OPPOSITE_CAP"
 //           : "WEEKEND";
 //
 //  3) De cooldown. markTradePlaced() wordt nergens aangeroepen. Voeg toe naast
@@ -777,6 +803,7 @@ module.exports = {
   DEFAULT_TP_RR, COLLECT_TP_RR, TP_RR_PER_SYMBOL, TP_RR_WINDOWS, getTpRR,
   MIN_CHAN_R, berekenChanR, chanROk,
   RISK_EUR, RISK_EQUITY_REF, NOODREM_POSITIES, MAX_CONCURRENT,
+  MAX_PER_SIDE, sidePositionsOk,
   getRiskEur, werkelijkRisicoEur, widenForStopLevel, HANDMATIG,
   MAX_TEGEN_GAP_R, tegenpositieOk,
   RISK_WINDOWS, GLOBAL_RISK_MULT, getRiskMult, roundLots,
