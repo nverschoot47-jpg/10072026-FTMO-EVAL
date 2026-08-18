@@ -528,6 +528,22 @@ function getCounterContext(symbol, direction, newTvEntry) {
   return out;
 }
 
+// ── PER-SIDE POSITIETELLING (v6.4.0) ──────────────────────────────────────
+// Telt hoeveel buys/sells ECHT open staan op MT5 voor een symbool — gebruikt
+// door canOpenNewTrade() om de 5-per-kant-limiet (session.js: sidePositionsOk)
+// af te dwingen. "Echt open" = niet mt5Closed en niet ghostFinalized, net als
+// getCounterContext() hierboven.
+function countSidePositions(symbol) {
+  let buyCount = 0, sellCount = 0;
+  for (const p of openPositions.values()) {
+    if (p.ghostFinalized || p.mt5Closed) continue;
+    if (p.symbol !== symbol) continue;
+    if (p.direction === "buy") buyCount++;
+    else if (p.direction === "sell") sellCount++;
+  }
+  return { buyCount, sellCount };
+}
+
 
 // ── GENORMALISEERDE CONTEXT-FEATURES ─────────────────────────────────────────
 // De webhook geeft FUTURES-prijzen (MGC1! ~4115.9). We handelen op de BROKER
@@ -1115,9 +1131,26 @@ app.post("/webhook", async (req, res) => {
     else { console.warn(`[Webhook] Circuit OPEN — order blocked for ${rawSym} ${direction}`); }
   }
 
-  const { allowed, reason: blockReason } = canOpenNewTrade(rawSym);
+  // v6.4.0: per-symbool, per-richting positielimiet (max 5 buy / max 5 sell,
+  // en zodra één zijde als eerste 5 bereikt wordt de tegenzijde gecapt op 4 —
+  // zie sidePositionsOk() in session.js). Daarvoor moet canOpenNewTrade() de
+  // huidige buy/sell-tellingen van dit symbool krijgen.
+  const _symKeyForGate = normalizeSymbol(rawSym);
+  const { buyCount: _buyCountForGate, sellCount: _sellCountForGate } =
+    _symKeyForGate ? countSidePositions(_symKeyForGate) : { buyCount: 0, sellCount: 0 };
+
+  const { allowed, reason: blockReason } = canOpenNewTrade(rawSym, new Date(), null, {
+    direction,
+    buyCount: _buyCountForGate,
+    sellCount: _sellCountForGate,
+  });
   if (!allowed) {
-    const blockOutcome = blockReason.startsWith("SYMBOL") ? "SYMBOL_NOT_ALLOWED" : blockReason.startsWith("TIME_BLOCK") ? "TIME_BLOCKED" : "WEEKEND";
+    const blockOutcome =
+        blockReason.startsWith("SYMBOL")       ? "SYMBOL_NOT_ALLOWED"
+      : blockReason.startsWith("TIME_BLOCK")   ? "TIME_BLOCKED"
+      : blockReason.startsWith("MAX_SIDE")     ? "MAX_SIDE"
+      : blockReason.startsWith("MAX_OPPOSITE") ? "MAX_OPPOSITE_CAP"
+      : "WEEKEND";
     await db.logSignal({ symbol: rawSym, direction, session: getSession(), outcome: blockOutcome, rejectReason: blockReason, tvEntry: safeNum(tvClose), slPct: safeNum(sl_pct), latencyMs: Date.now() - t0, slPoints: safeNum(sl_points), vwapMid: safeNum(vwap), vwapUpper: safeNum(vwap_upper), vwapLower: safeNum(vwap_lower), sessionHigh: safeNum(session_high), sessionLow: safeNum(session_low), dayHigh: safeNum(day_high), dayLow: safeNum(day_low) });
     await db.markInboxProcessed(_inboxId, blockOutcome).catch(() => {});
     return res.json({ ok: false, reason: blockReason });
@@ -1209,16 +1242,15 @@ app.post("/webhook", async (req, res) => {
     ? parseFloat((execPrice + slDist * tpRR).toFixed(6))
     : parseFloat((execPrice - slDist * tpRR).toFixed(6));
 
-  // ── Lot calculation — RISK-BASED, doel EUR 20 per trade ────────
-  // Teruggezet van "ALTIJD minimum lotsize" naar risk-based sizing, zodat
-  // RISK_EUR (session.js) de positiegrootte weer echt aanstuurt.
+  // ── Lot calculation — RISK-BASED, doel EUR 10 per trade ────────
+  // Risk-based sizing: RISK_EUR (session.js) stuurt de positiegrootte aan.
   //
   // contractSize wordt EXPLICIET gebruikt — niet de oude type-binaire
   // /100-gok, die 50x fout was voor XAGUSD (contractSize 5000).
   //
   // roundLots() kapt naar beneden af naar volStep en heeft volMin als vloer.
   // Waar het doelrisico een lot onder volMin oplevert, wint de vloer en ligt
-  // het werkelijke risico HOGER dan 20 — dat is precies "tenzij de stoploss
+  // het werkelijke risico HOGER dan 10 — dat is precies "tenzij de stoploss
   // dat niet toelaat, dan gaan we hoger in risk". De [Sizing]-log hieronder
   // meldt elk zo'n geval.
   const SIZING_EQUITY = safeNum(process.env.RISK_EQUITY) ?? latestEquity;
@@ -1425,7 +1457,7 @@ function dashboardHTML() {
   <div class="kst" style="grid-template-columns:repeat(5,1fr)" id="perf-kpis"></div></div>
 </div>
 <div class="pg" id="p-hwm">
-  <div class="card"><div class="chdr"><div class="ctitle"><div class="dot g"></div>Today <span class="bd-k" id="hwm-date" style="margin-left:4px">--</span></div><span class="cm">peak / trough open P&amp;L · resets daily</span></div>
+  <div class="card"><div class="chdr"><div class="ctitle"><div class="dot g"></div>Today <span class="bd-k" id="hwm-date">--</span></div><span class="cm">peak / trough open P&amp;L · resets daily</span></div>
   <div class="kst" style="grid-template-columns:repeat(4,1fr)" id="hwm-today"><div class="nd" style="grid-column:1/-1">Loading...</div></div></div>
   <div class="card"><div class="chdr"><div class="ctitle"><div class="dot b"></div>All-time peak</div><span class="cm">highest the account has ever reached</span></div>
   <div class="kst" style="grid-template-columns:repeat(4,1fr)" id="hwm-all"></div></div>
@@ -1576,66 +1608,4 @@ async function initBackground() {
     const states = await db.loadAllGhostStates();
     for (const g of states) {
       if (!g.positionId || !g.entry || !g.sl) continue;
-      const pos = { positionId: g.positionId, dailyLabel: g.dailyLabel, symbol: g.symbol, assetType: g.assetType, direction: g.direction, session: g.session, vwapPosition: g.vwapPosition, optimizerKey: g.optimizerKey, entry: g.entry, sl: g.sl, tp: g.tp, lots: g.lots, riskEur: g.riskEur, slPct: g.slPct, slDist: g.slDist, vwapMid: g.vwapMid, vwapUpper: g.vwapUpper, vwapLower: g.vwapLower, vwapBandPct: g.vwapBandPct, sessionHigh: g.sessionHigh, sessionLow: g.sessionLow, dayHigh: g.dayHigh, dayLow: g.dayLow, tvEntry: g.tvEntry, mt5Comment: g.mt5Comment, openedAt: g.openedAt, mt5Closed: g.mt5ClosedTP ?? false, currentPrice: g.entry, livePnl: 0,
-        ghost: { positionId: g.positionId, dailyLabel: g.dailyLabel, optimizerKey: g.optimizerKey, symbol: g.symbol, assetType: g.assetType, direction: g.direction, session: g.session, vwapPosition: g.vwapPosition, entry: g.entry, sl: g.sl, tp: g.tp, lots: g.lots, riskEur: g.riskEur, slPct: g.slPct, slDist: g.slDist, vwapMid: g.vwapMid, vwapUpper: g.vwapUpper, vwapLower: g.vwapLower, vwapBandPct: g.vwapBandPct, sessionHigh: g.sessionHigh, sessionLow: g.sessionLow, dayHigh: g.dayHigh, dayLow: g.dayLow, tvEntry: g.tvEntry, mt5Comment: g.mt5Comment, openedAt: g.openedAt, maxRR: g.maxRR ?? 0, peakRRPos: g.peakRRPos ?? 0, peakRRNeg: g.peakRRNeg ?? 0, currentRR: g.currentRR ?? null, lastPriceAt: g.lastPriceAt ?? null, estimatedCount: g.estimatedCount ?? 0, blackoutMin: g.blackoutMin ?? 0, rrMilestones: saneerMilestones(g.rrMilestones), mt5ClosedTP: g.mt5ClosedTP ?? false, mt5CloseAt: g.mt5CloseAt ?? null, mt5CloseReason: g.mt5CloseReason ?? null, phantomSLHit: g.phantomSLHit ?? false, slHitAt: g.slHitAt ?? null, timeToSLMin: g.timeToSLMin ?? null },
-      };
-      openPositions.set(g.positionId, pos);
-    }
-    console.log(`[DB] Restored ${openPositions.size} ghost states`);
-  } catch (e) { console.error("[DB] restore failed:", e.message); }
-
-  dbReady = true;
-  console.log("[PRONTO-AI] DB ready");
-
-  // ── MetaAPI startup ─────────────────────────────────────────────
-  // HERSTELD uit de v2.0.0-backup (server 10). Het v3.1.0-bestand was hier
-  // afgekapt: het eindigde midden in de account-information-call, en alles
-  // daarna — de positie-adoptie, de cron-jobs en de initBackground()-aanroep —
-  // ontbrak volledig. Zonder dit blok initialiseert de server de database en
-  // doet daarna niets meer: geen sync, geen ghost-updates.
-  if (META_API_TOKEN && META_ACCOUNT) {
-    try {
-      // Note: /deploy removed - not needed if account already deployed, causes rate limits
-      const acct = await Promise.race([
-        metaFetch(`/users/current/accounts/${META_ACCOUNT}/account-information`),
-        new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 20000)),
-      ]);
-      if (acct?.balance !== undefined) {
-        latestEquity   = parseFloat(acct.equity ?? acct.balance);
-        latestCurrency = acct.currency ?? "USD";
-        _acctCache = acct; _acctCacheTs = Date.now();
-        console.log(`[MetaAPI] Connected — ${acct.balance} ${acct.currency}`);
-        // Adopt live MT5 positions not in memory
-        const live = await getPositions();
-        for (const lp of live) {
-          if (!openPositions.has(String(lp.id))) await adoptPosition(lp);
-        }
-      }
-    } catch (e) {
-      console.error(`[MetaAPI] Startup failed: ${e.message}`);
-      // Reset fail counter - startup failure is expected during MetaAPI outages
-      _metaFails = 0; _circuitOpen = false;
-    }
-  } else {
-    console.warn("[MetaAPI] META_API_TOKEN or META_ACCOUNT not set — no MetaAPI connection");
-  }
-
-  cron.schedule("*/10 * * * * *", syncPositions);        // 10s to reduce MetaAPI load
-  cron.schedule("*/5 * * * *",    cleanupFinalizedGhosts);
-
-  // NIET uit de backup — de v2.0.0-versie kende /api/data-health nog niet.
-  // Het dashboard van v3.1.0 zegt "daily 06:00 UTC integrity scan", dus die
-  // cron hoorde in het afgekapte staartje te staan. Dit is een RECONSTRUCTIE:
-  // controleer of dit overeenkomt met wat er stond. Weghalen kan veilig — dan
-  // vult /api/data-health zich alleen nog via de handmatige POST-route.
-  cron.schedule("0 6 * * *", async () => {
-    try { await db.computeDataHealth(); }
-    catch (e) { console.warn("[DataHealth] scan failed:", e.message); }
-  });
-
-  console.log("[PRONTO-AI] Cron active — 10s sync");
-}
-
-initBackground().catch(e => {
-  console.error("[FATAL] initBackground:", e.message);
-});
+      const pos = { positionId: g.positionId, dailyLabel: g.dailyLabel, symbol: g.symbol, assetType: g.assetType, direction: g.direction, session: g.session, vwapPosition: g.vwapPosition, optimizerKey: g.optimizerKey, entry: g.entry, sl: g.sl, tp: g.tp, lots: g.lots, riskEur: g.riskEur, slPct: g.slPct, slDist: g.slDist, vwapMid: g.vwapMid, vwapUpper: g.vwapUpper, vwapLower: g.vwapLower, vwapBandPct: g.vwapBandPct, sessionHigh: g.sessionHigh, sessionLow: g.sessionLow, dayHigh: g.dayHigh, dayLow: g.dayLow, tvEntry: g.tvEntry, mt5Comment: g.mt5Comme
