@@ -76,17 +76,12 @@
 //   account past binnen normaal gedrag van dit systeem. Dat is geen defect —
 //   het is wat EUR 200 betekent bij deze variantie.
 //
-// ── VERPLICHTE ENV VAR ────────────────────────────────────────────────
-//
-//     RISK_EQUITY=50000
+// ── ENV VAR NIET MEER NODIG (v6.5.2) ───────────────────────────────────
 //
 //   server.js rekent: riskEur = SIZING_EQUITY x DEFAULT_RISK_PCT, waarbij
-//   SIZING_EQUITY = process.env.RISK_EQUITY ?? latestEquity.
-//
-//   Zet je RISK_EQUITY niet, dan pakt hij je ECHTE equity van EUR 200:
-//     200 x 0,00006 = EUR 0,012 -> lot 0,0001 -> roundLots forceert 0,01
-//     -> je riskeert EUR 1,04 per trade in plaats van EUR 3.
-//   Niet fataal, maar niet wat je instelt. Zet hem.
+//   SIZING_EQUITY nu hard-coded RISK_EQUITY_REF is (zie server.js) — geen
+//   process.env.RISK_EQUITY meer nodig. RISK_EUR / RISK_EUR_PER_SYMBOL zijn
+//   hierdoor altijd het ABSOLUTE euro-risico per trade, ongeacht live saldo.
 //
 // ── STOPGRENS — BESLIS DIT NU, NIET STRAKS ────────────────────────────
 //
@@ -201,7 +196,8 @@ const NOODREM_POSITIES = 20;
 const MAX_CONCURRENT   = NOODREM_POSITIES;
 
 // server.js rekent via SIZING_EQUITY x DEFAULT_RISK_PCT.
-// ZET RISK_EQUITY=50000 IN DE ENV — anders sizet hij op je echte EUR 200.
+// v6.5.2: SIZING_EQUITY is hard-coded op RISK_EQUITY_REF in server.js —
+// geen env var meer nodig, dit geldt altijd.
 const RISK_EQUITY_REF  = 50000;
 const DEFAULT_RISK_PCT = RISK_EUR / RISK_EQUITY_REF;   // 10/50000 = 0.0002
 
@@ -400,12 +396,9 @@ const SYMBOL_CATALOG    = FIRM_CFG.symbols;
 const BROKER            = FIRM;
 const BROKER_SYMBOL_MAP = { [FIRM]: FIRM_CFG.symbols };
 
-// Waarschuw luid als RISK_EQUITY ontbreekt in live-mode — dan sizet server.js
-// op de echte equity en klopt RISK_EUR niet.
-if (MODE !== "collect" && !process.env.RISK_EQUITY) {
-  console.warn(`[session.js] LET OP: RISK_EQUITY is niet gezet. server.js sizet dan op de ` +
-    `ECHTE account-equity in plaats van op ${RISK_EQUITY_REF}. Zet RISK_EQUITY=${RISK_EQUITY_REF}.`);
-}
+// v6.5.2: geen RISK_EQUITY env var meer nodig — server.js gebruikt nu altijd
+// hard-coded RISK_EQUITY_REF als SIZING_EQUITY (zie server.js). Deze waarschuwing
+// verwijderd omdat ze anders bij elke boot vals afgaat: er ontbreekt niets meer.
 
 const _xauGeblokt = (TIME_BLOCK_WINDOWS["XAUUSD"] || []).some(w => w.start === 0 && w.end === 2400);
 
