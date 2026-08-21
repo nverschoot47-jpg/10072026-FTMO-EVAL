@@ -168,6 +168,24 @@ const TIMEZONE = "Europe/Brussels";
 //   werkelijkRisicoEur() aan) om per symbool het ECHTE risico te zien.
 const RISK_EUR = 10;
 
+// ── PER-SYMBOOL RISICO-OVERRIDE ──────────────────────────────────────
+//   v6.5.0: MNQ1! (US100.cash) op verzoek naar EUR 60 per trade — alle
+//   andere symbolen blijven op de RISK_EUR default (10). Zelfde 5-4
+//   positielimiet-logica (MAX_PER_SIDE, sidePositionsOk) blijft ongewijzigd
+//   van toepassing — die is al per-symbool en hangt niet af van het
+//   risicobedrag.
+//   Voeg hier extra symbolen toe als er later meer overrides nodig zijn.
+const RISK_EUR_PER_SYMBOL = {
+  "US100.cash": 60,   // MNQ1!
+};
+
+/** Bedoeld risico in euro voor dit symbool. Valt terug op RISK_EUR als er
+ *  geen override is. Geen symbolKey meegeven -> de globale default. */
+function getRiskEurForSymbol(symbolKey) {
+  const override = RISK_EUR_PER_SYMBOL[symbolKey];
+  return Number.isFinite(override) ? override : RISK_EUR;
+}
+
 // ── PER-SIDE POSITIELIMIET ───────────────────────────────────────────
 //   v6.4.0: vervangt de oude globale NOODREM_POSITIES/MAX_CONCURRENT-cap.
 //   Max 5 open buys EN max 5 open sells per symbool. Zodra één zijde als
@@ -187,8 +205,12 @@ const MAX_CONCURRENT   = NOODREM_POSITIES;
 const RISK_EQUITY_REF  = 50000;
 const DEFAULT_RISK_PCT = RISK_EUR / RISK_EQUITY_REF;   // 10/50000 = 0.0002
 
-/** Risico in euro. Vast bedrag — geen staffel, geen plafond. */
-function getRiskEur() { return RISK_EUR; }
+/** Risico in euro. Vast bedrag — geen staffel, geen plafond.
+ *  symbolKey optioneel: geeft de per-symbool override terug indien gezet
+ *  (zie RISK_EUR_PER_SYMBOL), anders de globale RISK_EUR. */
+function getRiskEur(symbolKey) {
+  return symbolKey ? getRiskEurForSymbol(symbolKey) : RISK_EUR;
+}
 
 // Server SL = sl_pct (uit webhook) x SL_BUFFER_MULT x broker execution price.
 const SL_BUFFER_MULT = 1.5;
@@ -387,8 +409,10 @@ if (MODE !== "collect" && !process.env.RISK_EQUITY) {
 
 const _xauGeblokt = (TIME_BLOCK_WINDOWS["XAUUSD"] || []).some(w => w.start === 0 && w.end === 2400);
 
-console.log(`[session.js] v6.2.0 FIRM="${FIRM}" (${FIRM_CFG.label}) mode=${MODE} | ` +
-  `risk=${RISK_EUR}/trade (bedoeld, niet gegarandeerd bij min lot) maxPerSide=${MAX_PER_SIDE} | ` +
+const _riskOverridesStr = Object.entries(RISK_EUR_PER_SYMBOL).map(([k, v]) => `${k}=${v}`).join(",") || "geen";
+
+console.log(`[session.js] v6.5.0 FIRM="${FIRM}" (${FIRM_CFG.label}) mode=${MODE} | ` +
+  `risk=${RISK_EUR}/trade default (overrides: ${_riskOverridesStr}) maxPerSide=${MAX_PER_SIDE} | ` +
   `symbols=${Object.keys(SYMBOL_CATALOG).join(",")} alle op ${DEFAULT_TP_RR}R | ` +
   (MODE === "collect" ? `(collect -> ${COLLECT_TP_RR}R, geen filters)` :
     `XAU=${_xauGeblokt ? "GEBLOKKEERD" : "open"}`) + ` | ` +
@@ -714,7 +738,7 @@ function canOpenNewTrade(rawSymbol, date = null, openPositions = null, ctx = {})
   }
 
   return { allowed: true, reason: null, chanR,
-           riskEur: getRiskEur(),
+           riskEur: getRiskEur(sym),
            rr: getTpRR(sym, date) };
 }
 
@@ -802,9 +826,9 @@ module.exports = {
   canOpenNewTrade, TIME_BLOCK_WINDOWS, isTimeBlocked,
   DEFAULT_TP_RR, COLLECT_TP_RR, TP_RR_PER_SYMBOL, TP_RR_WINDOWS, getTpRR,
   MIN_CHAN_R, berekenChanR, chanROk,
-  RISK_EUR, RISK_EQUITY_REF, NOODREM_POSITIES, MAX_CONCURRENT,
+  RISK_EUR, RISK_EUR_PER_SYMBOL, RISK_EQUITY_REF, NOODREM_POSITIES, MAX_CONCURRENT,
   MAX_PER_SIDE, sidePositionsOk,
-  getRiskEur, werkelijkRisicoEur, widenForStopLevel, HANDMATIG,
+  getRiskEur, getRiskEurForSymbol, werkelijkRisicoEur, widenForStopLevel, HANDMATIG,
   MAX_TEGEN_GAP_R, tegenpositieOk,
   RISK_WINDOWS, GLOBAL_RISK_MULT, getRiskMult, roundLots,
   COOLDOWN_MIN, COOLDOWN_PER_SYMBOL,
