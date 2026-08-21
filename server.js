@@ -1613,7 +1613,8 @@ async function initBackground() {
   while (retries < 5) {
     try { await db.initDB(); break; }
     catch (e) { retries++; console.error(`[DB] init failed (${retries}/5): ${e.message}`); if (retries < 5) await new Promise(r => setTimeout(r, 5000 * retries)); else throw e; }
-// v6.4.1: de restore-loop hieronder bouwde eerder `pos` en `pos.ghost` op
+
+  // v6.4.1: de restore-loop hieronder bouwde eerder `pos` en `pos.ghost` op
   // als TWEE losse, extreem lange one-liners (elk 1500+ tekens). Dat is
   // precies het soort regel dat een editor, plak-actie, of upload met een
   // regellengte-limiet kan afkappen — en dat gaf exact de crash die je zag:
