@@ -1613,3 +1613,133 @@ async function initBackground() {
   while (retries < 5) {
     try { await db.initDB(); break; }
     catch (e) { retries++; console.error(`[DB] init failed (${retries}/5): ${e.message}`); if (retries < 5) await new Promise(r => setTimeout(r, 5000 * retries)); else throw e; }
+// v6.4.1: de restore-loop hieronder bouwde eerder `pos` en `pos.ghost` op
+  // als TWEE losse, extreem lange one-liners (elk 1500+ tekens). Dat is
+  // precies het soort regel dat een editor, plak-actie, of upload met een
+  // regellengte-limiet kan afkappen — en dat gaf exact de crash die je zag:
+  // "SyntaxError: Unexpected end of input" bij server.js:1611, midden in de
+  // object-literal. De CODE was niet stuk; de regel was te lang en kwetsbaar.
+  // Nu opgebouwd uit kleine, losse velden per regel — functioneel identiek,
+  // maar elke regel is kort genoeg om een afkap-fout te overleven zonder de
+  // hele boot te breken.
+  try {
+    const states = await db.loadAllGhostStates();
+    for (const g of states) {
+      if (!g.positionId || !g.entry || !g.sl) continue;
+
+      const sharedFields = {
+        positionId:   g.positionId,
+        dailyLabel:   g.dailyLabel,
+        symbol:       g.symbol,
+        assetType:    g.assetType,
+        direction:    g.direction,
+        session:      g.session,
+        vwapPosition: g.vwapPosition,
+        entry:        g.entry,
+        sl:           g.sl,
+        tp:           g.tp,
+        lots:         g.lots,
+        riskEur:      g.riskEur,
+        slPct:        g.slPct,
+        slDist:       g.slDist,
+        vwapMid:      g.vwapMid,
+        vwapUpper:    g.vwapUpper,
+        vwapLower:    g.vwapLower,
+        vwapBandPct:  g.vwapBandPct,
+        sessionHigh:  g.sessionHigh,
+        sessionLow:   g.sessionLow,
+        dayHigh:      g.dayHigh,
+        dayLow:       g.dayLow,
+        tvEntry:      g.tvEntry,
+        mt5Comment:   g.mt5Comment,
+        openedAt:     g.openedAt,
+      };
+
+      const ghost = {
+        ...sharedFields,
+        optimizerKey:    g.optimizerKey,
+        maxRR:           g.maxRR ?? 0,
+        peakRRPos:       g.peakRRPos ?? 0,
+        peakRRNeg:       g.peakRRNeg ?? 0,
+        currentRR:       g.currentRR ?? null,
+        lastPriceAt:     g.lastPriceAt ?? null,
+        estimatedCount:  g.estimatedCount ?? 0,
+        blackoutMin:     g.blackoutMin ?? 0,
+        rrMilestones:    saneerMilestones(g.rrMilestones),
+        mt5ClosedTP:     g.mt5ClosedTP ?? false,
+        mt5CloseAt:      g.mt5CloseAt ?? null,
+        mt5CloseReason:  g.mt5CloseReason ?? null,
+        phantomSLHit:    g.phantomSLHit ?? false,
+        slHitAt:         g.slHitAt ?? null,
+        timeToSLMin:     g.timeToSLMin ?? null,
+      };
+
+      const pos = {
+        ...sharedFields,
+        optimizerKey: g.optimizerKey,
+        mt5Closed:    g.mt5ClosedTP ?? false,
+        currentPrice: g.entry,
+        livePnl:      0,
+        ghost,
+      };
+
+      openPositions.set(g.positionId, pos);
+    }
+    console.log(`[DB] Restored ${openPositions.size} ghost states`);
+  } catch (e) { console.error("[DB] restore failed:", e.message); }
+
+  dbReady = true;
+  console.log("[PRONTO-AI] DB ready");
+
+  // ── MetaAPI startup ─────────────────────────────────────────────
+  // HERSTELD uit de v2.0.0-backup (server 10). Het v3.1.0-bestand was hier
+  // afgekapt: het eindigde midden in de account-information-call, en alles
+  // daarna — de positie-adoptie, de cron-jobs en de initBackground()-aanroep —
+  // ontbrak volledig. Zonder dit blok initialiseert de server de database en
+  // doet daarna niets meer: geen sync, geen ghost-updates.
+  if (META_API_TOKEN && META_ACCOUNT) {
+    try {
+      // Note: /deploy removed - not needed if account already deployed, causes rate limits
+      const acct = await Promise.race([
+        metaFetch(`/users/current/accounts/${META_ACCOUNT}/account-information`),
+        new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 20000)),
+      ]);
+      if (acct?.balance !== undefined) {
+        latestEquity   = parseFloat(acct.equity ?? acct.balance);
+        latestCurrency = acct.currency ?? "USD";
+        _acctCache = acct; _acctCacheTs = Date.now();
+        console.log(`[MetaAPI] Connected — ${acct.balance} ${acct.currency}`);
+        // Adopt live MT5 positions not in memory
+        const live = await getPositions();
+        for (const lp of live) {
+          if (!openPositions.has(String(lp.id))) await adoptPosition(lp);
+        }
+      }
+    } catch (e) {
+      console.error(`[MetaAPI] Startup failed: ${e.message}`);
+      // Reset fail counter - startup failure is expected during MetaAPI outages
+      _metaFails = 0; _circuitOpen = false;
+    }
+  } else {
+    console.warn("[MetaAPI] META_API_TOKEN or META_ACCOUNT not set — no MetaAPI connection");
+  }
+
+  cron.schedule("*/10 * * * * *", syncPositions);        // 10s to reduce MetaAPI load
+  cron.schedule("*/5 * * * *",    cleanupFinalizedGhosts);
+
+  // NIET uit de backup — de v2.0.0-versie kende /api/data-health nog niet.
+  // Het dashboard van v3.1.0 zegt "daily 06:00 UTC integrity scan", dus die
+  // cron hoorde in het afgekapte staartje te staan. Dit is een RECONSTRUCTIE:
+  // controleer of dit overeenkomt met wat er stond. Weghalen kan veilig — dan
+  // vult /api/data-health zich alleen nog via de handmatige POST-route.
+  cron.schedule("0 6 * * *", async () => {
+    try { await db.computeDataHealth(); }
+    catch (e) { console.warn("[DataHealth] scan failed:", e.message); }
+  });
+
+  console.log("[PRONTO-AI] Cron active — 10s sync");
+}
+
+initBackground().catch(e => {
+  console.error("[FATAL] initBackground:", e.message);
+});
