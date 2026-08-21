@@ -1262,7 +1262,12 @@ app.post("/webhook", async (req, res) => {
   // het werkelijke risico HOGER dan het doel — dat is precies "tenzij de
   // stoploss dat niet toelaat, dan gaan we hoger in risk". De [Sizing]-log
   // hieronder meldt elk zo'n geval.
-  const SIZING_EQUITY = safeNum(process.env.RISK_EQUITY) ?? latestEquity;
+  // v6.5.2: hard-coded to RISK_EQUITY_REF (geen env var meer nodig) —
+  // RISK_EUR / RISK_EUR_PER_SYMBOL (bv. US100.cash=60) zijn hierdoor altijd
+  // het ABSOLUTE euro-risico per trade, ongeacht live saldo. Voorheen kon
+  // dit via process.env.RISK_EQUITY worden overruled; dat pad is bewust
+  // verwijderd zodat er geen Railway-variabele meer hoeft te worden gezet.
+  const SIZING_EQUITY = RISK_EQUITY_REF;
   const riskMult      = getRiskMult(symbol, new Date());
   const targetRiskEur = getRiskEur(symbol);   // per-symbool doel (default RISK_EUR, of override)
   const riskEur = parseFloat(((SIZING_EQUITY / RISK_EQUITY_REF) * targetRiskEur * riskMult).toFixed(2));
