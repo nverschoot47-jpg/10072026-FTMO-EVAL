@@ -42,7 +42,7 @@ const {
   getVwapPosition, buildOptimizerKey,
   buildDailyLabel, canOpenNewTrade,
   getTpRR, roundLots, getRiskMult,
-  RISK_EUR, werkelijkRisicoEur,          // v6.2.0: log real $ risk at min-lot rounding
+  RISK_EUR, RISK_EQUITY_REF, getRiskEur, werkelijkRisicoEur,   // v6.2.0: log real $ risk at min-lot rounding
   widenForStopLevel,                     // v6.3.0: widen SL if broker's min stop-level requires it
 } = require("./session");
 
@@ -1048,7 +1048,7 @@ async function adoptPosition(lp) {
     positionId: id, dailyLabel: lp.comment?.match(/\d{2}\/\d{2}-#\d+/)?.[0] ?? null,
     symbol, assetType: symInfo.type, direction, session,
     vwapPosition: vwapPos, optimizerKey, entry, sl, tp, lots,   // was hardcoded "unknown" while optimizerKey used the REAL vwapPos -> the two disagreed
-    riskPct: DEFAULT_RISK_PCT, riskEur: null, slPct, slDist, slPoints: null,
+    riskPct: getRiskEur(symbol) / RISK_EQUITY_REF, riskEur: null, slPct, slDist, slPoints: null,
     vwapMid: null, vwapUpper: null, vwapLower: null, vwapBandPct: null,
     sessionHigh: null, sessionLow: null, dayHigh: null, dayLow: null,
     tvEntry: entry, executionPrice: entry, slippage: 0,
@@ -1242,29 +1242,40 @@ app.post("/webhook", async (req, res) => {
     ? parseFloat((execPrice + slDist * tpRR).toFixed(6))
     : parseFloat((execPrice - slDist * tpRR).toFixed(6));
 
-  // ── Lot calculation — RISK-BASED, doel EUR 10 per trade ────────
-  // Risk-based sizing: RISK_EUR (session.js) stuurt de positiegrootte aan.
+  // ── Lot calculation — RISK-BASED, per-symbool doelrisico ────────
+  // Risk-based sizing: getRiskEur(symbol) (session.js) stuurt de
+  // positiegrootte aan — RISK_EUR is de default (10), maar sommige
+  // symbolen hebben een eigen override (v6.5.0: MNQ1!/US100.cash -> 60,
+  // zie RISK_EUR_PER_SYMBOL in session.js).
+  //
+  // De equity-schaling blijft hetzelfde principe als voorheen (bedoeld
+  // risico bij RISK_EQUITY_REF equity, geschaald naar de werkelijke
+  // SIZING_EQUITY) — alleen nu per symbool i.p.v. één vaste DEFAULT_RISK_PCT
+  // voor alles:
+  //     riskEur = (SIZING_EQUITY / RISK_EQUITY_REF) x targetRiskEur x riskMult
   //
   // contractSize wordt EXPLICIET gebruikt — niet de oude type-binaire
   // /100-gok, die 50x fout was voor XAGUSD (contractSize 5000).
   //
   // roundLots() kapt naar beneden af naar volStep en heeft volMin als vloer.
   // Waar het doelrisico een lot onder volMin oplevert, wint de vloer en ligt
-  // het werkelijke risico HOGER dan 10 — dat is precies "tenzij de stoploss
-  // dat niet toelaat, dan gaan we hoger in risk". De [Sizing]-log hieronder
-  // meldt elk zo'n geval.
+  // het werkelijke risico HOGER dan het doel — dat is precies "tenzij de
+  // stoploss dat niet toelaat, dan gaan we hoger in risk". De [Sizing]-log
+  // hieronder meldt elk zo'n geval.
   const SIZING_EQUITY = safeNum(process.env.RISK_EQUITY) ?? latestEquity;
-  const riskMult = getRiskMult(symbol, new Date());
-  const riskEur = parseFloat((SIZING_EQUITY * DEFAULT_RISK_PCT * riskMult).toFixed(2));
+  const riskMult      = getRiskMult(symbol, new Date());
+  const targetRiskEur = getRiskEur(symbol);   // per-symbool doel (default RISK_EUR, of override)
+  const riskEur = parseFloat(((SIZING_EQUITY / RISK_EQUITY_REF) * targetRiskEur * riskMult).toFixed(2));
 
   const _contractSize = symInfo.contractSize ?? (symInfo.type === "index" ? 1 : 100);
   const lots = roundLots((riskEur / slDist) / _contractSize, symInfo);
 
   // Werkelijk $ risico bij deze lot + (evt. verbrede) slDist — dit IS het
-  // echte risico van deze trade, ongeacht wat riskEur/RISK_EUR als doel had.
+  // echte risico van deze trade, ongeacht wat riskEur/targetRiskEur als doel
+  // had.
   const echtRisico = werkelijkRisicoEur(symInfo, slDist, riskEur);
-  if (echtRisico > RISK_EUR * 1.2) {
-    console.warn(`[Sizing] ${symbol}: min lot ${lots} = WERKELIJK ${echtRisico} risico (doel was ${RISK_EUR})`);
+  if (echtRisico > targetRiskEur * 1.2) {
+    console.warn(`[Sizing] ${symbol}: min lot ${lots} = WERKELIJK ${echtRisico} risico (doel was ${targetRiskEur})`);
   }
 
   const dateStr    = getBrusselsDateStr();
@@ -1327,7 +1338,7 @@ app.post("/webhook", async (req, res) => {
     positionId, dailyLabel, symbol, assetType: symInfo.type,
     direction, session, vwapPosition: vwapPos, optimizerKey: optKey,
     entry: execPrice, sl: slPrice, tp: tpPrice, lots, tpRR,
-    riskPct: DEFAULT_RISK_PCT, riskEur, slPct, slDist,
+    riskPct: targetRiskEur / RISK_EQUITY_REF, riskEur, slPct, slDist,
     tvEntry, executionPrice: execPrice, slippage,
     vwapMid, vwapBandPct, ...wh,
     ctx,                                   // genormaliseerde features (vwapDistR, sessRangeR, posInSess/Day)
@@ -1602,10 +1613,3 @@ async function initBackground() {
   while (retries < 5) {
     try { await db.initDB(); break; }
     catch (e) { retries++; console.error(`[DB] init failed (${retries}/5): ${e.message}`); if (retries < 5) await new Promise(r => setTimeout(r, 5000 * retries)); else throw e; }
-  }
-
-  try {
-    const states = await db.loadAllGhostStates();
-    for (const g of states) {
-      if (!g.positionId || !g.entry || !g.sl) continue;
-      const pos = { positionId: g.positionId, dailyLabel: g.dailyLabel, symbol: g.symbol, assetType: g.assetType, direction: g.direction, session: g.session, vwapPosition: g.vwapPosition, optimizerKey: g.optimizerKey, entry: g.entry, sl: g.sl, tp: g.tp, lots: g.lots, riskEur: g.riskEur, slPct: g.slPct, slDist: g.slDist, vwapMid: g.vwapMid, vwapUpper: g.vwapUpper, vwapLower: g.vwapLower, vwapBandPct: g.vwapBandPct, sessionHigh: g.sessionHigh, sessionLow: g.sessionLow, dayHigh: g.dayHigh, dayLow: g.dayLow, tvEntry: g.tvEntry, mt5Comment: g.mt5Comme
